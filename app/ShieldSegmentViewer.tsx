@@ -12,12 +12,17 @@ type SegmentDefinition = {
   angle: number;
   color: number;
   explodeOrder: number;
+  outerArcFront: number;
+  innerArcFront: number;
+  outerArcBack: number;
+  innerArcBack: number;
 };
 
 type RuntimeSegment = {
   definition: SegmentDefinition;
   group: THREE.Group;
   body: THREE.Mesh<THREE.ExtrudeGeometry, THREE.MeshPhysicalMaterial>;
+  edges: THREE.LineSegments;
   epdm: THREE.Group;
   swell: THREE.Group;
   center: number;
@@ -30,20 +35,34 @@ const EPDM_RADIUS = 3.039;
 const SWELL_RADIUS = 3.069;
 
 const SEGMENTS: SegmentDefinition[] = [
-  { id: "B3", type: "标准块", start: -33.75, end: 33.75, angle: 67.5, color: 0xcfd5d5, explodeOrder: 4 },
-  { id: "B2", type: "标准块", start: 33.75, end: 101.25, angle: 67.5, color: 0xbec8c7, explodeOrder: 3 },
-  { id: "L2", type: "邻接块", start: 101.25, end: 170, angle: 68.75, color: 0xd8b46c, explodeOrder: 1 },
-  { id: "F", type: "封顶块", start: 170, end: 190, angle: 20, color: 0xe56f51, explodeOrder: 0 },
-  { id: "L1", type: "邻接块", start: 190, end: 258.75, angle: 68.75, color: 0xd8a968, explodeOrder: 2 },
-  { id: "B1", type: "标准块", start: 258.75, end: 326.25, angle: 67.5, color: 0xc7cfce, explodeOrder: 5 },
+  { id: "B3", type: "标准块", start: -33.75, end: 33.75, angle: 67.5, color: 0xcfd5d5, explodeOrder: 4, outerArcFront: 3.6521, innerArcFront: 3.2398, outerArcBack: 3.6521, innerArcBack: 3.2398 },
+  { id: "B2", type: "标准块", start: 33.75, end: 101.25, angle: 67.5, color: 0xbec8c7, explodeOrder: 3, outerArcFront: 3.6521, innerArcFront: 3.2398, outerArcBack: 3.6521, innerArcBack: 3.2398 },
+  { id: "L2", type: "邻接块", start: 101.25, end: 170, angle: 68.75, color: 0xd8b46c, explodeOrder: 1, outerArcFront: 3.6849, innerArcFront: 3.2403, outerArcBack: 3.8032, innerArcBack: 3.3589 },
+  { id: "F", type: "封顶块", start: 170, end: 190, angle: 20, color: 0xe56f51, explodeOrder: 0, outerArcFront: 1.1518, innerArcFront: 1.0789, outerArcBack: 0.9151, innerArcBack: 0.8416 },
+  { id: "L1", type: "邻接块", start: 190, end: 258.75, angle: 68.75, color: 0xd8a968, explodeOrder: 2, outerArcFront: 3.8032, innerArcFront: 3.3589, outerArcBack: 3.6849, innerArcBack: 3.2403 },
+  { id: "B1", type: "标准块", start: 258.75, end: 326.25, angle: 67.5, color: 0xc7cfce, explodeOrder: 5, outerArcFront: 3.6521, innerArcFront: 3.2398, outerArcBack: 3.6521, innerArcBack: 3.2398 },
 ];
 
 const toRadians = (degrees: number) => THREE.MathUtils.degToRad(degrees);
 const clamp = (value: number, min = 0, max = 1) => Math.min(max, Math.max(min, value));
 const easeInOut = (value: number) => value * value * (3 - 2 * value);
 
-const theoreticalLength = (radius: number, angle: number) =>
-  2 * radius * toRadians(angle) + 2 * RING_WIDTH;
+const interpolatedArc = (definition: SegmentDefinition, radius: number, face: "front" | "back") => {
+  const ratio = (radius - INNER_RADIUS) / (OUTER_RADIUS - INNER_RADIUS);
+  const inner = face === "front" ? definition.innerArcFront : definition.innerArcBack;
+  const outer = face === "front" ? definition.outerArcFront : definition.outerArcBack;
+  return inner + (outer - inner) * ratio;
+};
+
+const frameEdges = (definition: SegmentDefinition, radius: number) => [
+  { code: "①", name: "前环缝弧边", length: interpolatedArc(definition, radius, "front") },
+  { code: "②", name: "右纵缝直边", length: RING_WIDTH },
+  { code: "③", name: "后环缝弧边", length: interpolatedArc(definition, radius, "back") },
+  { code: "④", name: "左纵缝直边", length: RING_WIDTH },
+];
+
+const theoreticalLength = (definition: SegmentDefinition, radius: number) =>
+  frameEdges(definition, radius).reduce((sum, edge) => sum + edge.length, 0);
 
 const meters = (value: number) => `${value.toFixed(3)} m`;
 
@@ -166,7 +185,8 @@ export function ShieldSegmentViewer() {
   const progressRef = useRef(0);
   const playingRef = useRef(false);
   const directionRef = useRef(1);
-  const settingsRef = useRef({ showEpdm: true, showSwell: true, transparent: false });
+  const settingsRef = useRef({ showEpdm: true, showSwell: true, transparent: false, fullTransparent: false });
+  const soloRef = useRef<string | null>(null);
   const selectedRef = useRef("F");
 
   const [selected, setSelected] = useState("F");
@@ -175,18 +195,20 @@ export function ShieldSegmentViewer() {
   const [showEpdm, setShowEpdm] = useState(true);
   const [showSwell, setShowSwell] = useState(true);
   const [transparent, setTransparent] = useState(false);
+  const [fullTransparent, setFullTransparent] = useState(false);
+  const [soloSegment, setSoloSegment] = useState<string | null>(null);
   const [explodeProgress, setExplodeProgress] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [stretchRate, setStretchRate] = useState(0);
 
   const selectedDefinition = SEGMENTS.find((segment) => segment.id === selected) ?? SEGMENTS[0];
-  const selectedEpdm = theoreticalLength(EPDM_RADIUS, selectedDefinition.angle);
-  const selectedSwell = theoreticalLength(SWELL_RADIUS, selectedDefinition.angle);
+  const selectedEpdm = theoreticalLength(selectedDefinition, EPDM_RADIUS);
+  const selectedSwell = theoreticalLength(selectedDefinition, SWELL_RADIUS);
 
   const totals = useMemo(
     () => ({
-      epdm: SEGMENTS.reduce((sum, segment) => sum + theoreticalLength(EPDM_RADIUS, segment.angle), 0),
-      swell: SEGMENTS.reduce((sum, segment) => sum + theoreticalLength(SWELL_RADIUS, segment.angle), 0),
+      epdm: SEGMENTS.reduce((sum, segment) => sum + theoreticalLength(segment, EPDM_RADIUS), 0),
+      swell: SEGMENTS.reduce((sum, segment) => sum + theoreticalLength(segment, SWELL_RADIUS), 0),
     }),
     [],
   );
@@ -206,15 +228,20 @@ export function ShieldSegmentViewer() {
   }, [selected]);
 
   useEffect(() => {
-    settingsRef.current = { showEpdm, showSwell, transparent };
+    soloRef.current = soloSegment;
+  }, [soloSegment]);
+
+  useEffect(() => {
+    settingsRef.current = { showEpdm, showSwell, transparent, fullTransparent };
     runtimeRef.current.forEach((runtime) => {
       runtime.epdm.visible = showEpdm;
       runtime.swell.visible = showSwell;
-      runtime.body.material.opacity = transparent ? 0.42 : 1;
-      runtime.body.material.transparent = transparent;
-      runtime.body.material.depthWrite = !transparent;
+      runtime.body.material.opacity = fullTransparent ? 0 : transparent ? 0.42 : 1;
+      runtime.body.material.transparent = transparent || fullTransparent;
+      runtime.body.material.depthWrite = !transparent && !fullTransparent;
+      runtime.edges.visible = !fullTransparent;
     });
-  }, [showEpdm, showSwell, transparent]);
+  }, [showEpdm, showSwell, transparent, fullTransparent]);
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -291,8 +318,8 @@ export function ShieldSegmentViewer() {
       );
       group.add(edges);
 
-      const epdm = productFrame(EPDM_RADIUS, 0.035, 0.0165, definition, 0x253239, 0x6fd5c1);
-      const swell = productFrame(SWELL_RADIUS, 0.025, 0.004, definition, 0x58c5d8, 0x35a9c1);
+      const epdm = productFrame(EPDM_RADIUS, 0.035, 0.0165, definition, 0x050607, 0x1a1d1e);
+      const swell = productFrame(SWELL_RADIUS, 0.025, 0.004, definition, 0xd9342b, 0x761611);
       group.add(epdm, swell);
 
       const center = toRadians((definition.start + definition.end) / 2);
@@ -301,7 +328,7 @@ export function ShieldSegmentViewer() {
       group.add(label);
 
       scene.add(group);
-      return { definition, group, body, epdm, swell, center };
+      return { definition, group, body, edges, epdm, swell, center };
     });
     runtimeRef.current = runtime;
 
@@ -314,7 +341,10 @@ export function ShieldSegmentViewer() {
       pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
       pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
       raycaster.setFromCamera(pointer, camera);
-      const hits = raycaster.intersectObjects(runtime.map((item) => item.body), false);
+      const hitTargets = soloRef.current
+        ? runtime.filter((item) => item.definition.id === soloRef.current).map((item) => item.body)
+        : runtime.map((item) => item.body);
+      const hits = raycaster.intersectObjects(hitTargets, false);
       const next = (hits[0]?.object as typeof activeHover) ?? null;
 
       if (activeHover && activeHover !== next) {
@@ -341,8 +371,23 @@ export function ShieldSegmentViewer() {
       setSelected(activeHover.userData.segmentId as string);
     };
 
-    renderer.domElement.addEventListener("pointermove", updateHover);
-    renderer.domElement.addEventListener("pointerleave", () => {
+    const isolateAtPointer = () => {
+      if (!activeHover) return;
+      const id = activeHover.userData.segmentId as string;
+      setSelected(id);
+      setSoloSegment((current) => {
+        const next = current === id ? null : id;
+        soloRef.current = next;
+        return next;
+      });
+      progressRef.current = 0;
+      setExplodeProgress(0);
+      playingRef.current = false;
+      setPlaying(false);
+      controls.target.set(0, 0, 0);
+    };
+
+    const leavePointer = () => {
       if (activeHover) {
         activeHover.material.emissive.setHex(0x000000);
         activeHover.material.emissiveIntensity = 0;
@@ -350,8 +395,19 @@ export function ShieldSegmentViewer() {
       activeHover = null;
       setHovered(null);
       setTooltip((current) => ({ ...current, visible: false }));
-    });
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      soloRef.current = null;
+      setSoloSegment(null);
+    };
+
+    renderer.domElement.addEventListener("pointermove", updateHover);
+    renderer.domElement.addEventListener("pointerleave", leavePointer);
     renderer.domElement.addEventListener("click", selectAtPointer);
+    renderer.domElement.addEventListener("dblclick", isolateAtPointer);
+    window.addEventListener("keydown", handleKeyDown);
 
     const resize = () => {
       const rect = mount.getBoundingClientRect();
@@ -379,13 +435,46 @@ export function ShieldSegmentViewer() {
         }
       }
 
+      const solo = soloRef.current;
+      halo.visible = !solo;
       runtime.forEach((item) => {
-        const local = easeInOut(clamp(progressRef.current * SEGMENTS.length - item.definition.explodeOrder));
-        const distance = 1.22 * local;
-        item.group.position.set(Math.cos(item.center) * distance, Math.sin(item.center) * distance, local * 0.08);
-        item.group.rotation.z = Math.sin(item.center) * local * 0.018;
+        if (solo) {
+          const isActive = item.definition.id === solo;
+          item.group.visible = isActive;
+          if (isActive) {
+            const targetScale = Math.min(2.8, 1.62 * Math.sqrt(67.5 / item.definition.angle));
+            const centerRadius = (OUTER_RADIUS + INNER_RADIUS) / 2;
+            const targetX = -Math.cos(item.center) * centerRadius * targetScale;
+            const targetY = -Math.sin(item.center) * centerRadius * targetScale;
+            const smoothing = 0.13;
+            item.group.scale.x += (targetScale - item.group.scale.x) * smoothing;
+            item.group.scale.y = item.group.scale.x;
+            item.group.scale.z = item.group.scale.x;
+            item.group.position.x += (targetX - item.group.position.x) * smoothing;
+            item.group.position.y += (targetY - item.group.position.y) * smoothing;
+            item.group.position.z += (0 - item.group.position.z) * smoothing;
+            item.group.rotation.z += (0 - item.group.rotation.z) * smoothing;
+          }
+        } else {
+          item.group.visible = true;
+          const local = easeInOut(clamp(progressRef.current * SEGMENTS.length - item.definition.explodeOrder));
+          const distance = 1.22 * local;
+          const targetX = Math.cos(item.center) * distance;
+          const targetY = Math.sin(item.center) * distance;
+          const targetZ = local * 0.08;
+          const smoothing = 0.16;
+          item.group.scale.x += (1 - item.group.scale.x) * smoothing;
+          item.group.scale.y = item.group.scale.x;
+          item.group.scale.z = item.group.scale.x;
+          item.group.position.x += (targetX - item.group.position.x) * smoothing;
+          item.group.position.y += (targetY - item.group.position.y) * smoothing;
+          item.group.position.z += (targetZ - item.group.position.z) * smoothing;
+          item.group.rotation.z += (Math.sin(item.center) * local * 0.018 - item.group.rotation.z) * smoothing;
+        }
         item.epdm.visible = settingsRef.current.showEpdm;
         item.swell.visible = settingsRef.current.showSwell;
+        item.body.material.opacity = settingsRef.current.fullTransparent ? 0 : settingsRef.current.transparent ? 0.42 : 1;
+        item.edges.visible = !settingsRef.current.fullTransparent;
       });
 
       controls.update();
@@ -398,7 +487,10 @@ export function ShieldSegmentViewer() {
       cancelAnimationFrame(animationFrame);
       observer.disconnect();
       renderer.domElement.removeEventListener("pointermove", updateHover);
+      renderer.domElement.removeEventListener("pointerleave", leavePointer);
       renderer.domElement.removeEventListener("click", selectAtPointer);
+      renderer.domElement.removeEventListener("dblclick", isolateAtPointer);
+      window.removeEventListener("keydown", handleKeyDown);
       controls.dispose();
       renderer.dispose();
       runtime.forEach((item) => {
@@ -411,6 +503,10 @@ export function ShieldSegmentViewer() {
   }, []);
 
   const togglePlayback = () => {
+    if (soloRef.current) {
+      soloRef.current = null;
+      setSoloSegment(null);
+    }
     if (playing) {
       setPlaying(false);
       playingRef.current = false;
@@ -422,10 +518,17 @@ export function ShieldSegmentViewer() {
   };
 
   const jumpTo = (value: number) => {
+    soloRef.current = null;
+    setSoloSegment(null);
     setPlaying(false);
     playingRef.current = false;
     setExplodeProgress(value);
     progressRef.current = value;
+  };
+
+  const exitSolo = () => {
+    soloRef.current = null;
+    setSoloSegment(null);
   };
 
   const hoverDefinition = hovered ? SEGMENTS.find((segment) => segment.id === hovered) : null;
@@ -488,8 +591,25 @@ export function ShieldSegmentViewer() {
             <button className={`toggle-row ${showSwell ? "active" : ""}`} onClick={() => setShowSwell((value) => !value)} type="button">
               <span className="legend-dot swell-dot" /><span><b>遇水膨胀橡胶片</b><small>4 × 25 mm · 闭合框</small></span><i />
             </button>
-            <button className={`toggle-row ${transparent ? "active" : ""}`} onClick={() => setTransparent((value) => !value)} type="button">
+            <button
+              className={`toggle-row ${transparent ? "active" : ""}`}
+              onClick={() => {
+                setTransparent((value) => !value);
+                setFullTransparent(false);
+              }}
+              type="button"
+            >
               <span className="legend-dot shell-dot" /><span><b>管片半透明</b><small>观察密封框转角与接缝</small></span><i />
+            </button>
+            <button
+              className={`toggle-row ${fullTransparent ? "active" : ""}`}
+              onClick={() => {
+                setFullTransparent((value) => !value);
+                setTransparent(false);
+              }}
+              type="button"
+            >
+              <span className="legend-dot ghost-dot" /><span><b>管片全透明</b><small>仅保留两种密封产品</small></span><i />
             </button>
           </div>
 
@@ -518,19 +638,26 @@ export function ShieldSegmentViewer() {
         <section className="viewer-card" aria-label="盾构管片三维模型">
           <div ref={mountRef} className="canvas-mount" />
           <div className="viewer-gradient" />
-          <div className="orientation-note"><span>拖动旋转</span><span>滚轮缩放</span><span>点击选中</span></div>
+          <div className="orientation-note"><span>拖动旋转</span><span>滚轮缩放</span><span>点击选中</span><span>双击单块</span></div>
           <div className="axis-widget" aria-hidden="true"><i className="axis-y">Y</i><i className="axis-x">X</i><i className="axis-z">Z</i><b /></div>
+
+          {soloSegment && (
+            <button className="solo-exit" onClick={exitSolo} type="button">
+              <span aria-hidden="true">←</span> 返回整环 <kbd>ESC</kbd>
+            </button>
+          )}
 
           {tooltip.visible && hoverDefinition && (
             <div className="hover-card" style={{ left: tooltip.x, top: tooltip.y }}>
               <strong>{hoverDefinition.id} · {hoverDefinition.type}</strong>
-              <span>{hoverDefinition.angle.toFixed(2)}° · EPDM {meters(theoreticalLength(EPDM_RADIUS, hoverDefinition.angle))}</span>
+              <span>{hoverDefinition.angle.toFixed(2)}° · EPDM {meters(theoreticalLength(hoverDefinition, EPDM_RADIUS))}</span>
+              <em>双击进入单块观察</em>
             </div>
           )}
 
           <div className="model-caption">
             <span className="live-dot"><i /></span>
-            <div><b>一环六分块 · 拼装状态</b><small>F × 1 · L × 2 · B × 3</small></div>
+            <div><b>{soloSegment ? `${soloSegment} · 单块观察模式` : "一环六分块 · 拼装状态"}</b><small>{soloSegment ? "拖动可查看四周密封框细节" : "F × 1 · L × 2 · B × 3"}</small></div>
           </div>
         </section>
 
@@ -562,22 +689,41 @@ export function ShieldSegmentViewer() {
             <span className="cut-length">参考下料 {meters(selectedSwell / cutFactor)}</span>
           </div>
 
-          <div className="segment-selector" role="list" aria-label="选择管片">
-            {SEGMENTS.slice().sort((a, b) => a.explodeOrder - b.explodeOrder).map((segment) => (
-              <button
-                key={segment.id}
-                className={selected === segment.id ? "active" : ""}
-                onClick={() => setSelected(segment.id)}
-                type="button"
-              >
-                <span>{segment.id}</span><i>{segment.type}</i><b>{meters(theoreticalLength(EPDM_RADIUS, segment.angle))}</b>
-              </button>
-            ))}
+          <div className="edge-accordion" aria-label="各管片四边长度">
+            <div className="edge-section-title"><span>各块四边长度</span><small>点击展开 · 单位 m</small></div>
+            {SEGMENTS.slice().sort((a, b) => a.explodeOrder - b.explodeOrder).map((segment) => {
+              const epdmEdges = frameEdges(segment, EPDM_RADIUS);
+              const swellEdges = frameEdges(segment, SWELL_RADIUS);
+              return (
+                <details key={segment.id} open={selected === segment.id}>
+                  <summary onClick={() => setSelected(segment.id)}>
+                    <span>{segment.id}</span>
+                    <i>{segment.type}</i>
+                    <b>{meters(theoreticalLength(segment, EPDM_RADIUS))}</b>
+                  </summary>
+                  <div className="edge-table">
+                    <div className="edge-table-head"><span>边位</span><b>EPDM 黑</b><b>膨胀条 红</b></div>
+                    {epdmEdges.map((edge, index) => (
+                      <div className="edge-table-row" key={edge.code}>
+                        <span><i>{edge.code}</i>{edge.name}</span>
+                        <b>{edge.length.toFixed(3)}</b>
+                        <b>{swellEdges[index].length.toFixed(3)}</b>
+                      </div>
+                    ))}
+                    <div className="edge-physical">
+                      <span>管片弧边参考</span>
+                      <small>外弧 前/后 {segment.outerArcFront.toFixed(3)} / {segment.outerArcBack.toFixed(3)}</small>
+                      <small>内弧 前/后 {segment.innerArcFront.toFixed(3)} / {segment.innerArcBack.toFixed(3)}</small>
+                    </div>
+                  </div>
+                </details>
+              );
+            })}
           </div>
 
           <div className="formula-note">
             <span>计算口径</span>
-            <p>两条圆弧中心线 + 两条 1200 mm 直边；转角暂按 90° 理论交点，不计模压圆角修正。</p>
+            <p>弧边按模板图内外弧插值得到密封中心线长度，直边暂按 1200 mm；转角按 90° 理论交点，不计模压圆角修正。</p>
           </div>
         </aside>
       </section>
