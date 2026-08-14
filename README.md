@@ -1,100 +1,68 @@
-# vinext-starter
+# TBM Segment Digital Twin
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+盾构管片与密封产品三维数字孪生工具。项目包含固定的 WC06C Demo，以及通过表格填写管片参数、实时生成模型和计算产品长度的通用 V2。
 
-## Prerequisites
+## 在线版本
 
-- Node.js `>=22.13.0`
+- Demo：<https://wc06c-segment-seal-viewer.superlvpei.chatgpt.site/>
+- 通用 V2：<https://wc06c-segment-seal-viewer.superlvpei.chatgpt.site/v2>
 
-## Quick Start
+## 主要功能
+
+### Demo
+
+- 一环六块管片三维拼装与逐块拆解
+- 双击单块观察、半透明与全透明模式
+- 黑色 EPDM 弹性密封垫和红色遇水膨胀橡胶片闭合框
+- 每块四边长度、单块用量和整环用量
+- 根据安装拉伸率计算参考下料长度
+- 导出逐块、逐边及整环产品用量 CSV 明细表
+
+### 通用 V2
+
+- 设置管片外径、内径、环宽和模型起始角
+- 设置两种产品的中心线半径及截面尺寸
+- 表格填写块号、类型、中心角及前后内外弧长
+- 新增、复制和删除管片
+- 实时生成三维模型并检查中心角是否闭合为 360°
+- 实时计算每条边、每块管片和整环产品用量
+- 导出完整输入参数和产品用量 CSV
+
+## 计算口径
+
+闭合框由前环缝弧边、右纵缝直边、后环缝弧边和左纵缝直边组成。
+
+- 弧边长度：根据模板图给出的内外弧长，按产品中心线半径线性插值
+- 纵缝直边：按管片环宽计算
+- 单块用量：四条中心线理论长度之和
+- 参考下料长度：`理论中心线长度 ÷ (1 + 安装拉伸率)`
+
+## 本地运行
+
+要求 Node.js `>= 22.13.0`。
 
 ```bash
 npm install
 npm run dev
+```
+
+本地地址默认为 <http://localhost:3001/>，通用版路径为 <http://localhost:3001/v2>。
+
+## 检查与构建
+
+```bash
+npm run lint
 npm run build
 ```
 
-This starter does not use `wrangler.jsonc`.
+## 技术栈
 
-## Included Shape
+- React 19
+- TypeScript
+- Three.js
+- vinext / Vite
+- Cloudflare Workers-compatible Sites build
 
-- edit site code under `app/`
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
+## 当前范围
 
-## Workspace Auth Headers
-
-Signed-in visitors receive both `oai-authenticated-user-id` and `oai-authenticated-user-email`. Private Sites require every visitor to sign in; public Sites may also have anonymous visitors, for whom neither header is present.
-
-The user ID is stable for the same user on the same Site and different across Sites. Email and name are intended for display or contact purposes.
-
-SIWC-authenticated workspace sites may also receive
-`oai-authenticated-user-full-name` when the user's SIWC profile has a non-empty
-`name` claim. The full-name value is percent-encoded UTF-8 and is accompanied by
-`oai-authenticated-user-full-name-encoding: percent-encoded-utf-8`.
-
-Treat the full name as optional and fall back to email when it is absent:
-
-```tsx
-import { headers } from "next/headers";
-
-export default async function Home() {
-  const requestHeaders = await headers();
-  const userId = requestHeaders.get("oai-authenticated-user-id");
-  const email = requestHeaders.get("oai-authenticated-user-email");
-  const encodedFullName = requestHeaders.get("oai-authenticated-user-full-name");
-  const fullName =
-    encodedFullName &&
-    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
-      "percent-encoded-utf-8"
-      ? decodeURIComponent(encodedFullName)
-      : null;
-
-  const displayName = fullName ?? email;
-  // ...
-}
-```
-
-## Optional Dispatch-Owned ChatGPT Sign-In
-
-Import the ready-to-use helpers from `app/chatgpt-auth.ts` when the site needs
-optional or required ChatGPT sign-in:
-
-- Use `getChatGPTUser()` for optional signed-in UI.
-- Use `requireChatGPTUser(returnTo)` for server-rendered pages that should send
-  anonymous visitors through Sign in with ChatGPT.
-- Use `chatGPTSignInPath(returnTo)` and `chatGPTSignOutPath(returnTo)` for
-  browser links or actions.
-- Pass a same-origin relative `returnTo` path for the destination after sign-in
-  or sign-out. The helper validates and safely encodes it.
-- Mark protected pages with `export const dynamic = "force-dynamic"` because
-  they depend on per-request identity headers.
-
-Dispatch owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, `/callback`, the
-OAuth cookies, and identity header injection. Do not implement app routes for
-those reserved paths. Routes that do not import and call the helper remain
-anonymous-compatible.
-
-SIWC establishes identity only; it does not prove workspace membership. Use the
-Sites hosting platform's access policy controls for workspace-wide restrictions,
-or enforce explicit server-side membership or allowlist checks.
-
-Use SIWC for account pages, user-specific dashboards, saved records, and write
-actions tied to the current ChatGPT user. Leave public content anonymous.
-
-## Useful Commands
-
-- `npm run dev`: start local development
-- `npm run build`: verify the vinext build output
-- `npm test`: build the starter and verify its rendered loading skeleton
-- `npm run db:generate`: generate Drizzle migrations after schema changes
-
-## Learn More
-
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+当前版本暂不显示镂孔圈、钉筋粒子等细部构造。密封产品长度按理论中心线计算，模压圆角及现场安装修正可在后续版本继续细化。
