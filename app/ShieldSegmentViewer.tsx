@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { downloadCsv, type CsvValue } from "./lib/csv";
 
 type SegmentDefinition = {
   id: string;
@@ -217,6 +218,39 @@ export function ShieldSegmentViewer() {
   );
 
   const cutFactor = 1 + stretchRate / 100;
+
+  const exportUsageDetails = () => {
+    const rows: CsvValue[][] = [
+      ["WC06C 盾构管片密封产品用量明细表（Demo）"],
+      ["计算口径", "密封点中心线理论长度；参考下料长度 = 理论长度 ÷（1 + 安装拉伸率）"],
+      ["安装拉伸率", `${stretchRate.toFixed(1)}%`],
+      [],
+      ["记录类型", "块号", "管片类型", "中心角(°)", "产品", "规格(mm)", "边位", "边名称", "理论长度(m)", "参考下料(m)"],
+    ];
+
+    SEGMENTS.slice().sort((a, b) => a.explodeOrder - b.explodeOrder).forEach((segment) => {
+      [
+        { product: "EPDM 弹性密封垫", spec: "35 × 16.5", radius: EPDM_RADIUS },
+        { product: "遇水膨胀橡胶片", spec: "4 × 25", radius: SWELL_RADIUS },
+      ].forEach(({ product, spec, radius }) => {
+        const edges = frameEdges(segment, radius);
+        const subtotal = edges.reduce((sum, edge) => sum + edge.length, 0);
+        rows.push(["单块小计", segment.id, segment.type, segment.angle.toFixed(2), product, spec, "闭合框", "四边合计", subtotal.toFixed(3), (subtotal / cutFactor).toFixed(3)]);
+        edges.forEach((edge) => {
+          rows.push(["边长明细", segment.id, segment.type, segment.angle.toFixed(2), product, spec, edge.code, edge.name, edge.length.toFixed(3), (edge.length / cutFactor).toFixed(3)]);
+        });
+      });
+    });
+
+    rows.push(
+      [],
+      ["记录类型", "产品", "规格(mm)", "理论用量合计(m)", "参考下料合计(m)"],
+      ["整环汇总", "EPDM 弹性密封垫", "35 × 16.5", totals.epdm.toFixed(3), (totals.epdm / cutFactor).toFixed(3)],
+      ["整环汇总", "遇水膨胀橡胶片", "4 × 25", totals.swell.toFixed(3), (totals.swell / cutFactor).toFixed(3)],
+    );
+
+    downloadCsv("WC06C-盾构管片密封产品用量明细-Demo.csv", rows);
+  };
 
   useEffect(() => {
     progressRef.current = explodeProgress;
@@ -735,6 +769,11 @@ export function ShieldSegmentViewer() {
             <span>计算口径</span>
             <p>两种闭合框的弧边均按模板图内外弧插值得到中心线长度，直边暂按 1200 mm；转角按 90° 理论交点。红色框在三维显示中适度放大并移到端面外缘，长度仍按 4 × 25 mm 产品中心线实尺计算。</p>
           </div>
+
+          <button className="export-detail-button" onClick={exportUsageDetails} type="button">
+            <span aria-hidden="true">↓</span>
+            <div><b>导出产品用量明细表</b><small>逐块小计 · 四边明细 · 整环汇总（CSV）</small></div>
+          </button>
         </aside>
       </section>
 
