@@ -33,6 +33,9 @@ const INNER_RADIUS = 2.75;
 const RING_WIDTH = 1.2;
 const EPDM_RADIUS = 3.039;
 const SWELL_RADIUS = 3.069;
+const SWELL_DISPLAY_RADIUS = 3.08;
+const SWELL_DISPLAY_WIDTH = 0.04;
+const SWELL_DISPLAY_HEIGHT = 0.01;
 
 const SEGMENTS: SegmentDefinition[] = [
   { id: "B3", type: "标准块", start: -33.75, end: 33.75, angle: 67.5, color: 0xcfd5d5, explodeOrder: 4, outerArcFront: 3.6521, innerArcFront: 3.2398, outerArcBack: 3.6521, innerArcBack: 3.2398 },
@@ -319,7 +322,14 @@ export function ShieldSegmentViewer() {
       group.add(edges);
 
       const epdm = productFrame(EPDM_RADIUS, 0.035, 0.0165, definition, 0x050607, 0x1a1d1e);
-      const swell = productFrame(SWELL_RADIUS, 0.025, 0.004, definition, 0xd9342b, 0x761611);
+      const swell = productFrame(
+        SWELL_DISPLAY_RADIUS,
+        SWELL_DISPLAY_WIDTH,
+        SWELL_DISPLAY_HEIGHT,
+        definition,
+        0xff3b32,
+        0x8f0c08,
+      );
       group.add(epdm, swell);
 
       const center = toRadians((definition.start + definition.end) / 2);
@@ -589,7 +599,7 @@ export function ShieldSegmentViewer() {
               <span className="legend-dot epdm-dot" /><span><b>EPDM 弹性密封垫</b><small>35 × 16.5 mm · 闭合框</small></span><i />
             </button>
             <button className={`toggle-row ${showSwell ? "active" : ""}`} onClick={() => setShowSwell((value) => !value)} type="button">
-              <span className="legend-dot swell-dot" /><span><b>遇水膨胀橡胶片</b><small>4 × 25 mm · 闭合框</small></span><i />
+              <span className="legend-dot swell-dot" /><span><b>遇水膨胀橡胶片</b><small>4 × 25 mm · 每块四边闭合框（显示放大）</small></span><i />
             </button>
             <button
               className={`toggle-row ${transparent ? "active" : ""}`}
@@ -650,14 +660,14 @@ export function ShieldSegmentViewer() {
           {tooltip.visible && hoverDefinition && (
             <div className="hover-card" style={{ left: tooltip.x, top: tooltip.y }}>
               <strong>{hoverDefinition.id} · {hoverDefinition.type}</strong>
-              <span>{hoverDefinition.angle.toFixed(2)}° · EPDM {meters(theoreticalLength(hoverDefinition, EPDM_RADIUS))}</span>
+              <span>{hoverDefinition.angle.toFixed(2)}° · EPDM {meters(theoreticalLength(hoverDefinition, EPDM_RADIUS))} · 红框 {meters(theoreticalLength(hoverDefinition, SWELL_RADIUS))}</span>
               <em>双击进入单块观察</em>
             </div>
           )}
 
           <div className="model-caption">
             <span className="live-dot"><i /></span>
-            <div><b>{soloSegment ? `${soloSegment} · 单块观察模式` : "一环六分块 · 拼装状态"}</b><small>{soloSegment ? "拖动可查看四周密封框细节" : "F × 1 · L × 2 · B × 3"}</small></div>
+            <div><b>{soloSegment ? `${soloSegment} · 单块观察模式` : "一环六分块 · 拼装状态"}</b><small>{soloSegment ? "拖动可查看两种产品的四边闭合框" : "红色闭合框布置在各块管片端面外缘"}</small></div>
           </div>
         </section>
 
@@ -668,7 +678,7 @@ export function ShieldSegmentViewer() {
           </div>
 
           <div className="selected-title">
-            <div><h3>{selectedDefinition.type}（{selectedDefinition.id}）</h3><p>工厂硫化闭合框 · 90° 模压角</p></div>
+            <div><h3>{selectedDefinition.type}（{selectedDefinition.id}）</h3><p>两种产品均为四边闭合框 · 90° 模压角</p></div>
           </div>
 
           <div className="dimension-grid">
@@ -684,7 +694,7 @@ export function ShieldSegmentViewer() {
             <span className="cut-length">参考下料 {meters(selectedEpdm / cutFactor)}</span>
           </div>
           <div className="length-card swell-card">
-            <div className="length-title"><span className="legend-dot swell-dot" /><div><b>遇水膨胀橡胶片</b><small>理论中心线长度</small></div></div>
+            <div className="length-title"><span className="legend-dot swell-dot" /><div><b>遇水膨胀橡胶片</b><small>闭合框理论中心线长度</small></div></div>
             <strong>{meters(selectedSwell)}</strong>
             <span className="cut-length">参考下料 {meters(selectedSwell / cutFactor)}</span>
           </div>
@@ -723,13 +733,13 @@ export function ShieldSegmentViewer() {
 
           <div className="formula-note">
             <span>计算口径</span>
-            <p>弧边按模板图内外弧插值得到密封中心线长度，直边暂按 1200 mm；转角按 90° 理论交点，不计模压圆角修正。</p>
+            <p>两种闭合框的弧边均按模板图内外弧插值得到中心线长度，直边暂按 1200 mm；转角按 90° 理论交点。红色框在三维显示中适度放大并移到端面外缘，长度仍按 4 × 25 mm 产品中心线实尺计算。</p>
           </div>
         </aside>
       </section>
 
       <footer className="summary-bar">
-        <div className="summary-intro"><span>Σ</span><div><b>单环理论用量</b><small>6 个独立闭合框 · 暂不含损耗</small></div></div>
+        <div className="summary-intro"><span>Σ</span><div><b>单环理论用量</b><small>每块管片各 2 个独立闭合框 · 暂不含损耗</small></div></div>
         <div className="summary-metric"><span className="legend-dot epdm-dot" /><div><small>EPDM 合计</small><b>{meters(totals.epdm)}</b></div><em>下料 {meters(totals.epdm / cutFactor)}</em></div>
         <div className="summary-metric"><span className="legend-dot swell-dot" /><div><small>遇水膨胀橡胶片合计</small><b>{meters(totals.swell)}</b></div><em>下料 {meters(totals.swell / cutFactor)}</em></div>
         <div className="accuracy-note"><i /> 当前为结构图纸驱动的第一版几何模型</div>
