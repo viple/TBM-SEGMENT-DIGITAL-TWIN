@@ -12,6 +12,7 @@ import {
   SCHEMA_VERSION,
   buildUsagePayload,
   calculateSegments,
+  modelerStateFromPayload,
   safeNumber,
   validateUsage,
 } from "../app/lib/segmentUsage.ts";
@@ -120,6 +121,33 @@ test("算量契约：两产品 × 四边明细、整环合计、拉伸率下料�
   approx(payload.combined.theoreticalLengthMm, epdmTheory + swellTheory, 1e-9);
   approx(payload.combined.projectTheoreticalMm, (epdmTheory + swellTheory) * 100, 1e-9);
   approx(payload.combined.projectCutMm, payload.combined.cutLengthMm * 100, 1e-9);
+});
+
+test("契约回灌建模器：往返后块数、块号、手填偏移与整环合计一致", () => {
+  const ring = { ...DEFAULT_RING, wedgeAmount: 36, stretchRate: 2.5 };
+  const segments = DEFAULT_SEGMENTS.map((segment, index) =>
+    index === 2 ? { ...segment, wedgeOffsetLeft: 14, wedgeOffsetRight: -9 } : segment,
+  );
+  const payload = buildUsagePayload(ring, DEFAULT_PRODUCTS, segments, { ringCount: 300, generatedAt: "2026-01-01T00:00:00.000Z" });
+  const restored = modelerStateFromPayload(payload);
+
+  assert.deepEqual(restored.ring, ring);
+  assert.deepEqual(restored.products, DEFAULT_PRODUCTS);
+  // 契约以 null 表示「按封顶块中心自动计算」，与建模器的 undefined 等价
+  assert.deepEqual(
+    restored.segments,
+    segments.map((segment) => ({
+      ...segment,
+      wedgeOffsetLeft: segment.wedgeOffsetLeft ?? null,
+      wedgeOffsetRight: segment.wedgeOffsetRight ?? null,
+    })),
+  );
+
+  const rebuilt = buildUsagePayload(restored.ring, restored.products, restored.segments, {
+    ringCount: payload.ringCount,
+    generatedAt: payload.generatedAt,
+  });
+  assert.deepEqual(rebuilt, payload);
 });
 
 test("手动接缝偏移：覆盖自动值并进入纵缝直边", () => {

@@ -358,6 +358,8 @@ export type ProductUsageSummary = {
 
 export type PayloadSegment = {
   seq: number;
+  /** 建模器行标识（回灌建模器时保持选中/新增/复制的行身份） */
+  rowId: string;
   code: string;
   type: string;
   angle: number;
@@ -367,6 +369,9 @@ export type PayloadSegment = {
   frontInnerArc: number;
   backOuterArc: number;
   backInnerArc: number;
+  /** 手填左/右缝偏移（null = 按封顶块中心对称自动计算） */
+  wedgeOffsetLeft: number | null;
+  wedgeOffsetRight: number | null;
   leftSeamOffset: number;
   rightSeamOffset: number;
   autoLeftSeamOffset: number;
@@ -432,6 +437,7 @@ export function buildUsagePayload(
 
   const payloadSegments: PayloadSegment[] = calculated.map((segment, index) => ({
     seq: index + 1,
+    rowId: segment.rowId,
     code: segment.code,
     type: segment.type,
     angle: segment.angle,
@@ -441,6 +447,8 @@ export function buildUsagePayload(
     frontInnerArc: safeNumber(segment.innerArcFront),
     backOuterArc: safeNumber(segment.outerArcBack),
     backInnerArc: safeNumber(segment.innerArcBack),
+    wedgeOffsetLeft: segment.wedgeOffsetLeft ?? null,
+    wedgeOffsetRight: segment.wedgeOffsetRight ?? null,
     leftSeamOffset: segment.leftOffset,
     rightSeamOffset: segment.rightOffset,
     autoLeftSeamOffset: segment.autoLeftOffset,
@@ -476,5 +484,46 @@ export function buildUsagePayload(
       projectCutMm: combinedCut * ringCount,
     },
     validation,
+  };
+}
+
+export type ModelerState = {
+  ring: RingParameters;
+  products: ProductSet;
+  segments: SegmentInput[];
+};
+
+/** 把算量契约回灌为建模器状态（载入已保存方案时使用，与 buildUsagePayload 互逆） */
+export function modelerStateFromPayload(payload: SegmentUsagePayload): ModelerState {
+  const ring: RingParameters = {
+    projectName: payload.ring?.projectName ?? payload.projectName ?? "",
+    outerDiameter: safeNumber(payload.ring?.outerDiameter),
+    innerDiameter: safeNumber(payload.ring?.innerDiameter),
+    ringWidth: safeNumber(payload.ring?.ringWidth),
+    wedgeAmount: safeNumber(payload.ring?.wedgeAmount),
+    startAngle: safeNumber(payload.ring?.startAngle),
+    stretchRate: safeNumber(payload.ring?.stretchRate),
+  };
+  const product = (key: ProductKey): ProductParameters => ({
+    centerRadius: safeNumber(payload.products?.[key]?.centerRadius) || DEFAULT_PRODUCTS[key].centerRadius,
+    width: safeNumber(payload.products?.[key]?.width) || DEFAULT_PRODUCTS[key].width,
+    height: safeNumber(payload.products?.[key]?.height) || DEFAULT_PRODUCTS[key].height,
+  });
+  const segments: SegmentInput[] = (payload.segments ?? []).map((segment, index) => ({
+    rowId: segment.rowId || `restored-${index + 1}`,
+    code: segment.code,
+    type: segment.type,
+    angle: safeNumber(segment.angle),
+    outerArcFront: safeNumber(segment.frontOuterArc),
+    innerArcFront: safeNumber(segment.frontInnerArc),
+    outerArcBack: safeNumber(segment.backOuterArc),
+    innerArcBack: safeNumber(segment.backInnerArc),
+    wedgeOffsetLeft: segment.wedgeOffsetLeft ?? null,
+    wedgeOffsetRight: segment.wedgeOffsetRight ?? null,
+  }));
+  return {
+    ring,
+    products: { epdm: product("epdm"), swell: product("swell") },
+    segments,
   };
 }
