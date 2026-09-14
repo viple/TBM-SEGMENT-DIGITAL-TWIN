@@ -4,12 +4,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { downloadCsv, type CsvValue } from "./lib/csv";
+import { buildProductFrame, buildSegmentGeometry } from "./lib/segmentGeometry";
 
 type RingParameters = {
   projectName: string;
   outerDiameter: number;
   innerDiameter: number;
   ringWidth: number;
+  /** 楔形量(mm)：双面楔形，最小环宽在封顶块对称中心线，0 = 等宽环 */
+  wedgeAmount: number;
   startAngle: number;
   stretchRate: number;
 };
@@ -34,6 +37,10 @@ type SegmentInput = {
   innerArcFront: number;
   outerArcBack: number;
   innerArcBack: number;
+  /** 左缝楔形偏移(mm)，空 = 自动按封顶块中心对称计算 */
+  wedgeOffsetLeft?: number | null;
+  /** 右缝楔形偏移(mm)，空 = 自动按封顶块中心对称计算 */
+  wedgeOffsetRight?: number | null;
 };
 
 type EdgeLength = {
@@ -43,8 +50,24 @@ type EdgeLength = {
 };
 
 type CalculatedSegment = SegmentInput & {
+  /** 前端面角位（度，由前外弧沿环累加） */
   start: number;
   end: number;
+  /** 后端面角位（度，接缝偏移错位后，EPDM 中心线半径定义） */
+  backStart: number;
+  backEnd: number;
+  /** 后端面角位（度，遇水膨胀橡胶片中心线半径定义） */
+  swellBackStart: number;
+  swellBackEnd: number;
+  /** 左/右接缝处的局部环宽(mm)：B(θ) = 环宽 − (楔形量/2)·cos(θ − θK) */
+  leftRingWidth: number;
+  rightRingWidth: number;
+  /** 自动计算的左/右缝偏移(mm，EPDM 中心线半径处) */
+  autoLeftOffset: number;
+  autoRightOffset: number;
+  /** 生效的左/右缝偏移(mm，手动值优先) */
+  leftOffset: number;
+  rightOffset: number;
   epdmEdges: EdgeLength[];
   swellEdges: EdgeLength[];
   epdmTotal: number;
@@ -64,6 +87,7 @@ const DEFAULT_RING: RingParameters = {
   outerDiameter: 6200,
   innerDiameter: 5500,
   ringWidth: 1200,
+  wedgeAmount: 0,
   startAngle: -33.75,
   stretchRate: 0,
 };
@@ -76,8 +100,8 @@ const DEFAULT_PRODUCTS: ProductSet = {
 const DEFAULT_SEGMENTS: SegmentInput[] = [
   { rowId: "wc-b3", code: "B3", type: "标准块", angle: 67.5, outerArcFront: 3652.1, innerArcFront: 3239.8, outerArcBack: 3652.1, innerArcBack: 3239.8 },
   { rowId: "wc-b2", code: "B2", type: "标准块", angle: 67.5, outerArcFront: 3652.1, innerArcFront: 3239.8, outerArcBack: 3652.1, innerArcBack: 3239.8 },
-  { rowId: "wc-l2", code: "L2", type: "邻接块", angle: 68.75, outerArcFront: 3684.9, innerArcFront: 3240.3, outerArcBack: 3803.2, innerArcBack: 3358.9 },
-  { rowId: "wc-f", code: "F", type: "封顶块", angle: 20, outerArcFront: 1151.8, innerArcFront: 1078.9, outerArcBack: 915.1, innerArcBack: 841.6 },
+  { rowId: "wc-l2", code: "L2", type: "邻接块", angle: 68.75, outerArcFront: 3803.2, innerArcFront: 3358.9, outerArcBack: 3684.9, innerArcBack: 3240.3 },
+  { rowId: "wc-f", code: "F", type: "封顶块", angle: 20, outerArcFront: 915.1, innerArcFront: 841.6, outerArcBack: 1151.8, innerArcBack: 1078.9 },
   { rowId: "wc-l1", code: "L1", type: "邻接块", angle: 68.75, outerArcFront: 3803.2, innerArcFront: 3358.9, outerArcBack: 3684.9, innerArcBack: 3240.3 },
   { rowId: "wc-b1", code: "B1", type: "标准块", angle: 67.5, outerArcFront: 3652.1, innerArcFront: 3239.8, outerArcBack: 3652.1, innerArcBack: 3239.8 },
 ];
@@ -104,103 +128,130 @@ function interpolatedArc(
   return centerRadius * toRadians(Math.max(0, segment.angle));
 }
 
+// 楔形偏移默认以封顶块中心线对称：F 两侧偏移 = ±(F 后弧 − F 前弧) / 2（产品中心线半径处），
+// 再沿环向两侧传播：左接缝偏移 = 右接缝偏移 − (后弧 − 前弧)。相邻块共享同一接缝偏移。
+function autoWedgeOffsets(
+  segments: SegmentInput[],
+  centerRadius: number,
+  innerRadius: number,
+  outerRadius: number,
+) {
+  const arcs = segments.map((segment) => ({
+    front: interpolatedArc(segment, centerRadius, innerRadius, outerRadius, "front"),
+    back: interpolatedArc(segment, centerRadius, innerRadius, outerRadius, "back"),
+  }));
+  const keyIndex = Math.max(0, segments.findIndex((segment) => (segment.type ?? "").includes("封顶")));
+  const half = (arcs[keyIndex].back - arcs[keyIndex].front) / 2;
+  const offsets = new Array<number>(segments.length + 1);
+  offsets[keyIndex] = -half;
+  offsets[keyIndex + 1] = half;
+  for (let index = keyIndex - 1; index >= 0; index -= 1) {
+    offsets[index] = offsets[index + 1] - (arcs[index].back - arcs[index].front);
+  }
+  for (let index = keyIndex + 1; index < segments.length; index += 1) {
+    offsets[index + 1] = offsets[index] + (arcs[index].back - arcs[index].front);
+  }
+  return offsets;
+}
+
+function resolveWedgeOffsets(segments: SegmentInput[], autoOffsets: number[]) {
+  return segments.map((segment, index) => ({
+    left: segment.wedgeOffsetLeft == null ? autoOffsets[index] : safeNumber(segment.wedgeOffsetLeft),
+    right: segment.wedgeOffsetRight == null ? autoOffsets[index + 1] : safeNumber(segment.wedgeOffsetRight),
+  }));
+}
+
+function arcClosureStatus(segments: SegmentInput[]) {
+  const frontOuter = segments.reduce((sum, segment) => sum + safeNumber(segment.outerArcFront), 0);
+  const backOuter = segments.reduce((sum, segment) => sum + safeNumber(segment.outerArcBack), 0);
+  const frontInner = segments.reduce((sum, segment) => sum + safeNumber(segment.innerArcFront), 0);
+  const backInner = segments.reduce((sum, segment) => sum + safeNumber(segment.innerArcBack), 0);
+  const applicable = frontOuter > 0 || backOuter > 0 || frontInner > 0 || backInner > 0;
+  const error = Math.max(Math.abs(frontOuter - backOuter), Math.abs(frontInner - backInner));
+  return { applicable, error };
+}
+
 function productEdges(
   segment: SegmentInput,
+  resolved: { left: number; right: number },
+  leftRingWidth: number,
+  rightRingWidth: number,
   centerRadius: number,
   ring: RingParameters,
 ) {
   const outerRadius = ring.outerDiameter / 2;
   const innerRadius = ring.innerDiameter / 2;
+  const frontArc = interpolatedArc(segment, centerRadius, innerRadius, outerRadius, "front");
+  const backArc = interpolatedArc(segment, centerRadius, innerRadius, outerRadius, "back");
   return [
-    { code: "①", name: "前环缝弧边", length: interpolatedArc(segment, centerRadius, innerRadius, outerRadius, "front") },
-    { code: "②", name: "右纵缝直边", length: ring.ringWidth },
-    { code: "③", name: "后环缝弧边", length: interpolatedArc(segment, centerRadius, innerRadius, outerRadius, "back") },
-    { code: "④", name: "左纵缝直边", length: ring.ringWidth },
+    { code: "①", name: "前环缝弧边", length: frontArc },
+    { code: "②", name: "右纵缝直边", length: Math.hypot(rightRingWidth, resolved.right) },
+    { code: "③", name: "后环缝弧边", length: backArc },
+    { code: "④", name: "左纵缝直边", length: Math.hypot(leftRingWidth, resolved.left) },
   ];
 }
 
 function calculateSegments(segments: SegmentInput[], ring: RingParameters, products: ProductSet) {
+  const innerRadius = ring.innerDiameter / 2;
+  const outerRadius = ring.outerDiameter / 2;
+  // 前端接缝角位（度）由前外弧沿环累加（前外弧留空/为 0 时按中心角），保证前端面无缝闭合
+  const spans = segments.map((segment) => {
+    const outerArc = safeNumber(segment.outerArcFront);
+    if (outerArc > 0 && outerRadius > 0) return (outerArc / outerRadius) * (180 / Math.PI);
+    return Math.max(0, safeNumber(segment.angle));
+  });
+  const frontStarts: number[] = [];
   let cursor = ring.startAngle;
-  return segments.map<CalculatedSegment>((segment) => {
+  spans.forEach((span) => {
+    frontStarts.push(cursor);
+    cursor += span;
+  });
+  // 局部环宽 B(θ) = 环宽 − (楔形量/2)·cos(θ − θK)，θK 为封顶块前端中心角位（最小环宽处）
+  const keyIndex = Math.max(0, segments.findIndex((segment) => (segment.type ?? "").includes("封顶")));
+  const keyAngle = toRadians(frontStarts[keyIndex] + spans[keyIndex] / 2);
+  const wedge = Math.min(Math.max(safeNumber(ring.wedgeAmount), 0), ring.ringWidth);
+  const ringWidthAt = (angleDeg: number) => ring.ringWidth - (wedge / 2) * Math.cos(toRadians(angleDeg) - keyAngle);
+  const epdmAuto = autoWedgeOffsets(segments, products.epdm.centerRadius, innerRadius, outerRadius);
+  const swellAuto = autoWedgeOffsets(segments, products.swell.centerRadius, innerRadius, outerRadius);
+  const epdmResolved = resolveWedgeOffsets(segments, epdmAuto);
+  const swellResolved = resolveWedgeOffsets(segments, swellAuto);
+  const epdmRadius = products.epdm.centerRadius;
+  const swellRadius = products.swell.centerRadius;
+  return segments.map<CalculatedSegment>((segment, index) => {
     const angle = Math.max(0, safeNumber(segment.angle));
-    const start = cursor;
-    const end = cursor + angle;
-    cursor = end;
-    const epdmEdges = productEdges(segment, products.epdm.centerRadius, ring);
-    const swellEdges = productEdges(segment, products.swell.centerRadius, ring);
+    const start = frontStarts[index];
+    const end = start + spans[index];
+    const leftOffset = epdmResolved[index].left;
+    const rightOffset = epdmResolved[index].right;
+    const backStart = start + (leftOffset / epdmRadius) * (180 / Math.PI);
+    const backEnd = end + (rightOffset / epdmRadius) * (180 / Math.PI);
+    const swellBackStart = start + (swellResolved[index].left / swellRadius) * (180 / Math.PI);
+    const swellBackEnd = end + (swellResolved[index].right / swellRadius) * (180 / Math.PI);
+    const leftRingWidth = ringWidthAt(start);
+    const rightRingWidth = ringWidthAt(end);
+    const epdmEdges = productEdges(segment, epdmResolved[index], leftRingWidth, rightRingWidth, products.epdm.centerRadius, ring);
+    const swellEdges = productEdges(segment, swellResolved[index], leftRingWidth, rightRingWidth, products.swell.centerRadius, ring);
     return {
       ...segment,
       angle,
       start,
       end,
+      backStart,
+      backEnd,
+      swellBackStart,
+      swellBackEnd,
+      leftRingWidth,
+      rightRingWidth,
+      autoLeftOffset: epdmAuto[index],
+      autoRightOffset: epdmAuto[index + 1],
+      leftOffset,
+      rightOffset,
       epdmEdges,
       swellEdges,
       epdmTotal: epdmEdges.reduce((sum, edge) => sum + edge.length, 0),
       swellTotal: swellEdges.reduce((sum, edge) => sum + edge.length, 0),
     };
   });
-}
-
-function annularShape(inner: number, outer: number, start: number, end: number) {
-  const shape = new THREE.Shape();
-  const startRad = toRadians(start);
-  const endRad = toRadians(end);
-  shape.moveTo(outer * Math.cos(startRad), outer * Math.sin(startRad));
-  shape.absarc(0, 0, outer, startRad, endRad, false);
-  shape.lineTo(inner * Math.cos(endRad), inner * Math.sin(endRad));
-  shape.absarc(0, 0, inner, endRad, startRad, true);
-  shape.closePath();
-  return shape;
-}
-
-function sectorGeometry(inner: number, outer: number, start: number, end: number, depth: number, bevel = false) {
-  const geometry = new THREE.ExtrudeGeometry(annularShape(inner, outer, start, end), {
-    depth,
-    bevelEnabled: bevel,
-    bevelSegments: bevel ? 2 : 0,
-    bevelSize: bevel ? Math.min(0.008, (outer - inner) * 0.03) : 0,
-    bevelThickness: bevel ? Math.min(0.008, depth * 0.03) : 0,
-    curveSegments: Math.max(24, Math.ceil(Math.abs(end - start))),
-  });
-  geometry.translate(0, 0, -depth / 2);
-  geometry.computeVertexNormals();
-  return geometry;
-}
-
-function productFrame(
-  radius: number,
-  radialWidth: number,
-  height: number,
-  ringWidth: number,
-  start: number,
-  end: number,
-  color: number,
-  emissive: number,
-) {
-  const group = new THREE.Group();
-  const material = new THREE.MeshPhysicalMaterial({
-    color,
-    emissive,
-    emissiveIntensity: color === 0xff3b32 ? 0.34 : 0.16,
-    roughness: 0.58,
-    metalness: 0.01,
-    clearcoat: 0.22,
-  });
-  const front = new THREE.Mesh(sectorGeometry(radius - radialWidth / 2, radius + radialWidth / 2, start, end, height), material);
-  front.position.z = ringWidth / 2 + height / 2 + 0.003;
-  group.add(front);
-  const back = front.clone();
-  back.position.z = -ringWidth / 2 - height / 2 - 0.003;
-  group.add(back);
-
-  [start, end].forEach((angle) => {
-    const rad = toRadians(angle);
-    const endBar = new THREE.Mesh(new THREE.BoxGeometry(radialWidth, height, ringWidth + height * 2 + 0.012), material);
-    endBar.position.set(radius * Math.cos(rad), radius * Math.sin(rad), 0);
-    endBar.rotation.z = rad;
-    group.add(endBar);
-  });
-  return group;
 }
 
 function textSprite(label: string) {
@@ -261,11 +312,29 @@ export function UniversalShieldConfigurator() {
   const [showEpdm, setShowEpdm] = useState(true);
   const [showSwell, setShowSwell] = useState(true);
   const [transparent, setTransparent] = useState(false);
+  const [soloRowId, setSoloRowId] = useState<string | null>(null);
+  const soloRef = useRef<string | null>(null);
 
   const calculated = useMemo(() => calculateSegments(segments, ring, products), [segments, ring, products]);
   const angleSum = calculated.reduce((sum, segment) => sum + segment.angle, 0);
   const closureDelta = angleSum - 360;
   const isClosed = Math.abs(closureDelta) <= 0.05;
+  const arcClosure = arcClosureStatus(segments);
+  const isArcClosed = !arcClosure.applicable || arcClosure.error <= 0.5;
+  // 相邻块共享同一接缝：左缝偏移(块 k) 应与右缝偏移(块 k−1) 一致，含首尾接缝
+  const seamIssues: string[] = [];
+  calculated.forEach((segment, index) => {
+    const neighbor = calculated[(index - 1 + calculated.length) % calculated.length];
+    const delta = Math.abs(segment.leftOffset - neighbor.rightOffset);
+    if (delta > 0.5) seamIssues.push(`接缝 ${neighbor.code}/${segment.code} 偏移不一致 ${delta.toFixed(1)} mm`);
+  });
+  const closureIssues: string[] = [];
+  if (!isClosed) closureIssues.push(`角度偏差 ${closureDelta.toFixed(2)}°`);
+  if (!isArcClosed) closureIssues.push(`前后弧长不闭合 ${arcClosure.error.toFixed(1)} mm`);
+  closureIssues.push(...seamIssues);
+  if (ring.wedgeAmount < 0 || ring.wedgeAmount >= ring.ringWidth) {
+    closureIssues.push(`楔形量需在 0 ~ ${ring.ringWidth} mm 之间`);
+  }
   const ringIsValid = ring.outerDiameter > ring.innerDiameter && ring.innerDiameter > 0 && ring.ringWidth > 0;
   const stretchFactor = 1 + Math.max(0, ring.stretchRate) / 100;
   const totals = useMemo(() => ({
@@ -273,6 +342,7 @@ export function UniversalShieldConfigurator() {
     swell: calculated.reduce((sum, segment) => sum + segment.swellTotal, 0),
   }), [calculated]);
   const selected = calculated.find((segment) => segment.rowId === selectedRowId) ?? calculated[0];
+  const soloSegment = calculated.find((segment) => segment.rowId === soloRowId) ?? null;
 
   const updateRing = <K extends keyof RingParameters>(key: K, value: RingParameters[K]) => {
     setRing((current) => ({ ...current, [key]: value }));
@@ -282,7 +352,7 @@ export function UniversalShieldConfigurator() {
     setProducts((current) => ({ ...current, [product]: { ...current[product], [key]: value } }));
   };
 
-  const updateSegment = (rowId: string, key: keyof Omit<SegmentInput, "rowId">, value: string | number) => {
+  const updateSegment = (rowId: string, key: keyof Omit<SegmentInput, "rowId">, value: string | number | null) => {
     setSegments((current) => current.map((segment) => segment.rowId === rowId ? { ...segment, [key]: value } : segment));
   };
 
@@ -298,6 +368,8 @@ export function UniversalShieldConfigurator() {
       innerArcFront: 0,
       outerArcBack: 0,
       innerArcBack: 0,
+      wedgeOffsetLeft: null,
+      wedgeOffsetRight: null,
     }]);
     setSelectedRowId(rowId);
   };
@@ -315,7 +387,26 @@ export function UniversalShieldConfigurator() {
     const next = segments.filter((segment) => segment.rowId !== rowId);
     setSegments(next);
     if (selectedRowId === rowId) setSelectedRowId(next[0].rowId);
+    if (soloRowId === rowId) {
+      soloRef.current = null;
+      setSoloRowId(null);
+    }
   };
+
+  const exitSolo = () => {
+    soloRef.current = null;
+    setSoloRowId(null);
+  };
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      soloRef.current = null;
+      setSoloRowId(null);
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
 
   const resetToDemo = () => {
     setRing({ ...DEFAULT_RING });
@@ -329,16 +420,16 @@ export function UniversalShieldConfigurator() {
     const rows: CsvValue[][] = [
       ["盾构管片通用建模器 V2 · 参数与产品用量明细"],
       ["项目名称", ring.projectName],
-      ["外径(mm)", ring.outerDiameter, "内径(mm)", ring.innerDiameter, "环宽(mm)", ring.ringWidth],
-      ["起始角(°)", ring.startAngle, "中心角合计(°)", angleSum.toFixed(3), "闭合校验", isClosed ? "通过" : `偏差 ${closureDelta.toFixed(3)}°`],
+      ["外径(mm)", ring.outerDiameter, "内径(mm)", ring.innerDiameter, "环宽(mm)", ring.ringWidth, "楔形量(mm)", ring.wedgeAmount],
+      ["起始角(°)", ring.startAngle, "中心角合计(°)", angleSum.toFixed(3), "闭合校验", closureIssues.length === 0 ? "通过" : closureIssues.join(" · ")],
       ["安装拉伸率", `${ring.stretchRate.toFixed(1)}%`],
       ["EPDM", `${products.epdm.width} × ${products.epdm.height} mm`, "中心线半径(mm)", products.epdm.centerRadius],
       ["遇水膨胀橡胶片", `${products.swell.height} × ${products.swell.width} mm`, "中心线半径(mm)", products.swell.centerRadius],
       [],
       ["管片输入参数"],
-      ["序号", "块号", "类型", "中心角(°)", "前外弧(mm)", "前内弧(mm)", "后外弧(mm)", "后内弧(mm)"],
+      ["序号", "块号", "类型", "中心角(°)", "前外弧(mm)", "前内弧(mm)", "后外弧(mm)", "后内弧(mm)", "左缝偏移(mm)", "右缝偏移(mm)"],
     ];
-    calculated.forEach((segment, index) => rows.push([index + 1, segment.code, segment.type, segment.angle, segment.outerArcFront, segment.innerArcFront, segment.outerArcBack, segment.innerArcBack]));
+    calculated.forEach((segment, index) => rows.push([index + 1, segment.code, segment.type, segment.angle, segment.outerArcFront, segment.innerArcFront, segment.outerArcBack, segment.innerArcBack, segment.wedgeOffsetLeft ?? `自动 ${segment.autoLeftOffset.toFixed(1)}`, segment.wedgeOffsetRight ?? `自动 ${segment.autoRightOffset.toFixed(1)}`]));
     rows.push([], ["产品用量明细"], ["记录类型", "块号", "类型", "产品", "边位", "边名称", "理论长度(m)", "参考下料(m)"]);
     calculated.forEach((segment) => {
       [
@@ -362,6 +453,11 @@ export function UniversalShieldConfigurator() {
   useEffect(() => {
     const mount = mountRef.current;
     if (!mount || !ringIsValid || calculated.length === 0) return;
+    // 单块观察的行被删除时退出该模式
+    if (soloRef.current && !calculated.some((segment) => segment.rowId === soloRef.current)) {
+      soloRef.current = null;
+      setSoloRowId(null);
+    }
     const outerRadius = ring.outerDiameter / 2000;
     const innerRadius = ring.innerDiameter / 2000;
     const ringWidth = ring.ringWidth / 1000;
@@ -406,7 +502,24 @@ export function UniversalShieldConfigurator() {
         opacity: transparent ? 0.38 : 1,
         emissive: 0x000000,
       });
-      const geometry = sectorGeometry(innerRadius, outerRadius, segment.start, segment.end, ringWidth, true);
+      const keyIndex = Math.max(0, calculated.findIndex((candidate) => (candidate.type ?? "").includes("封顶")));
+      const keyAngle = toRadians(calculated[keyIndex].start + (calculated[keyIndex].end - calculated[keyIndex].start) / 2);
+      const wedgeAmountM = Math.min(Math.max(ring.wedgeAmount, 0), ring.ringWidth) / 1000;
+      const frontStartRad = toRadians(segment.start);
+      const frontEndRad = toRadians(segment.end);
+      const backStartRad = toRadians(segment.backStart);
+      const backEndRad = toRadians(segment.backEnd);
+      const geometry = buildSegmentGeometry(
+        innerRadius,
+        outerRadius,
+        frontStartRad,
+        frontEndRad,
+        backStartRad,
+        backEndRad,
+        ringWidth,
+        wedgeAmountM,
+        keyAngle,
+      );
       const body = new THREE.Mesh(geometry, material);
       body.castShadow = true;
       body.receiveShadow = true;
@@ -417,7 +530,7 @@ export function UniversalShieldConfigurator() {
       const epdmRadius = products.epdm.centerRadius / 1000;
       const epdmWidth = Math.max(products.epdm.width / 1000, outerRadius * 0.006);
       const epdmHeight = Math.max(products.epdm.height / 1000, outerRadius * 0.003);
-      const epdm = productFrame(epdmRadius, epdmWidth, epdmHeight, ringWidth, segment.start, segment.end, 0x030405, 0x14191a);
+      const epdm = buildProductFrame(epdmRadius, epdmWidth, epdmHeight, ringWidth, outerRadius, wedgeAmountM, keyAngle, frontStartRad, frontEndRad, backStartRad, backEndRad, 0x030405, 0x14191a, 0.16);
       epdm.visible = showEpdm;
       group.add(epdm);
 
@@ -425,7 +538,9 @@ export function UniversalShieldConfigurator() {
       const swellHeight = Math.max(products.swell.height / 1000, outerRadius * 0.0032);
       const requestedSwellRadius = products.swell.centerRadius / 1000;
       const swellRadius = Math.max(requestedSwellRadius, outerRadius - swellWidth / 2);
-      const swell = productFrame(swellRadius, swellWidth, swellHeight, ringWidth, segment.start, segment.end, 0xff3b32, 0x8f0c08);
+      const swellBackStartRad = toRadians(segment.swellBackStart);
+      const swellBackEndRad = toRadians(segment.swellBackEnd);
+      const swell = buildProductFrame(swellRadius, swellWidth, swellHeight, ringWidth, outerRadius, wedgeAmountM, keyAngle, frontStartRad, frontEndRad, swellBackStartRad, swellBackEndRad, 0xff3b32, 0x8f0c08, 0.34);
       swell.visible = showSwell;
       group.add(swell);
 
@@ -442,15 +557,35 @@ export function UniversalShieldConfigurator() {
 
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
+    const hitTargets = () => {
+      const solo = soloRef.current;
+      return solo
+        ? runtime.filter((item) => item.rowId === solo).map((item) => item.body)
+        : runtime.map((item) => item.body);
+    };
     const selectSegment = (event: PointerEvent) => {
       const rect = renderer.domElement.getBoundingClientRect();
       pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
       pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
       raycaster.setFromCamera(pointer, camera);
-      const hit = raycaster.intersectObjects(runtime.map((item) => item.body), false)[0];
+      const hit = raycaster.intersectObjects(hitTargets(), false)[0];
       if (hit) setSelectedRowId(hit.object.userData.rowId as string);
     };
+    const isolateAtPointer = (event: MouseEvent) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(pointer, camera);
+      const hit = raycaster.intersectObjects(runtime.map((item) => item.body), false)[0];
+      if (!hit) return;
+      const rowId = hit.object.userData.rowId as string;
+      setSelectedRowId(rowId);
+      soloRef.current = rowId;
+      setSoloRowId(rowId);
+      controls.target.set(0, 0, 0);
+    };
     renderer.domElement.addEventListener("pointerdown", selectSegment);
+    renderer.domElement.addEventListener("dblclick", isolateAtPointer);
 
     const resize = () => {
       const width = Math.max(1, mount.clientWidth);
@@ -466,6 +601,49 @@ export function UniversalShieldConfigurator() {
     let frame = 0;
     const render = () => {
       controls.update();
+      const solo = soloRef.current;
+      runtime.forEach((item) => {
+        if (!solo) {
+          item.group.visible = true;
+          const amount = explodeRef.current / 100;
+          const distance = outerRadius * 0.58 * amount;
+          const targetX = Math.cos(item.center) * distance;
+          const targetY = Math.sin(item.center) * distance;
+          const targetZ = (item.order - (runtime.length - 1) / 2) * outerRadius * 0.035 * amount;
+          const smoothing = 0.16;
+          item.group.position.x += (targetX - item.group.position.x) * smoothing;
+          item.group.position.y += (targetY - item.group.position.y) * smoothing;
+          item.group.position.z += (targetZ - item.group.position.z) * smoothing;
+          item.group.scale.x += (1 - item.group.scale.x) * smoothing;
+          item.group.scale.y = item.group.scale.x;
+          item.group.scale.z = item.group.scale.x;
+          item.group.rotation.z += (0 - item.group.rotation.z) * smoothing;
+          const opacityTarget = transparent ? 0.38 : 1;
+          item.body.material.opacity += (opacityTarget - item.body.material.opacity) * smoothing;
+          item.body.material.transparent = opacityTarget < 1;
+          return;
+        }
+        const isActive = item.rowId === solo;
+        item.group.visible = isActive;
+        if (!isActive) return;
+        const segment = calculated.find((candidate) => candidate.rowId === solo);
+        const angle = segment ? segment.angle : 67.5;
+        const targetScale = Math.min(2.8, 1.62 * Math.sqrt(67.5 / Math.max(angle, 1)));
+        const centerRadius = (outerRadius + innerRadius) / 2;
+        const targetX = -Math.cos(item.center) * centerRadius * targetScale;
+        const targetY = -Math.sin(item.center) * centerRadius * targetScale;
+        const smoothing = 0.13;
+        item.group.scale.x += (targetScale - item.group.scale.x) * smoothing;
+        item.group.scale.y = item.group.scale.x;
+        item.group.scale.z = item.group.scale.x;
+        item.group.position.x += (targetX - item.group.position.x) * smoothing;
+        item.group.position.y += (targetY - item.group.position.y) * smoothing;
+        item.group.position.z += (0 - item.group.position.z) * smoothing;
+        item.group.rotation.z += (0 - item.group.rotation.z) * smoothing;
+        // 单块观察时自动半透明，便于查看两种密封产品的闭合框
+        item.body.material.opacity += (0.32 - item.body.material.opacity) * smoothing;
+        item.body.material.transparent = true;
+      });
       renderer.render(scene, camera);
       frame = requestAnimationFrame(render);
     };
@@ -475,6 +653,7 @@ export function UniversalShieldConfigurator() {
       cancelAnimationFrame(frame);
       resizeObserver.disconnect();
       renderer.domElement.removeEventListener("pointerdown", selectSegment);
+      renderer.domElement.removeEventListener("dblclick", isolateAtPointer);
       controls.dispose();
       scene.traverse((object) => {
         if (object instanceof THREE.Mesh || object instanceof THREE.LineSegments) {
@@ -491,8 +670,7 @@ export function UniversalShieldConfigurator() {
 
   useEffect(() => {
     explodeRef.current = explodeProgress;
-    applyExplode(runtimeRef.current, explodeProgress, ring.outerDiameter / 2000);
-  }, [explodeProgress, ring.outerDiameter]);
+  }, [explodeProgress]);
 
   useEffect(() => {
     runtimeRef.current.forEach((runtime) => {
@@ -509,7 +687,7 @@ export function UniversalShieldConfigurator() {
           <div><small>PARAMETRIC SEGMENT LAB</small><h1>盾构管片通用建模器</h1></div>
         </div>
         <div className="v2-top-actions">
-          <span className={`v2-closure-chip ${isClosed ? "is-valid" : "is-warning"}`}>{isClosed ? "✓ 角度闭合" : `角度偏差 ${closureDelta.toFixed(2)}°`}</span>
+          <span className={`v2-closure-chip ${closureIssues.length === 0 ? "is-valid" : "is-warning"}`}>{closureIssues.length === 0 ? "✓ 角度闭合 · 弧长闭合" : closureIssues.join(" · ")}</span>
           {/* vinext dev currently duplicates React inside next/link; a native route link avoids that runtime fault. */}
           {/* eslint-disable-next-line @next/next/no-html-link-for-pages */}
           <a href="/">返回 Demo</a>
@@ -525,6 +703,7 @@ export function UniversalShieldConfigurator() {
               <NumericField label="管片外径" value={ring.outerDiameter} unit="mm" onChange={(value) => updateRing("outerDiameter", value)} />
               <NumericField label="管片内径" value={ring.innerDiameter} unit="mm" onChange={(value) => updateRing("innerDiameter", value)} />
               <NumericField label="环宽" value={ring.ringWidth} unit="mm" onChange={(value) => updateRing("ringWidth", value)} />
+              <NumericField label="楔形量" value={ring.wedgeAmount} unit="mm" step={0.5} onChange={(value) => updateRing("wedgeAmount", value)} />
               <NumericField label="模型起始角" value={ring.startAngle} unit="°" step={0.1} onChange={(value) => updateRing("startAngle", value)} />
               <NumericField label="安装拉伸率" value={ring.stretchRate} unit="%" step={0.1} onChange={(value) => updateRing("stretchRate", value)} />
             </div>
@@ -552,10 +731,15 @@ export function UniversalShieldConfigurator() {
             <div ref={mountRef} className="v2-canvas" />
             <div className="v2-model-head">
               <div><small>LIVE 3D MODEL</small><b>{ring.projectName || "未命名圆环"}</b></div>
-              <span>{calculated.length} 块 · {angleSum.toFixed(2)}°</span>
+              <span>{soloSegment ? `${soloSegment.code} · 单块观察模式` : `${calculated.length} 块 · ${angleSum.toFixed(2)}°`}</span>
             </div>
+            {soloSegment && (
+              <button className="v2-solo-exit" onClick={exitSolo} type="button">
+                <span aria-hidden="true">←</span> 返回整环 <kbd>ESC</kbd>
+              </button>
+            )}
             {!ringIsValid && <div className="v2-model-error">外径必须大于内径，且环宽需要大于 0</div>}
-            {selected && <div className="v2-selected-card"><small>当前选中</small><b>{selected.code} · {selected.type}</b><span>EPDM {meters(selected.epdmTotal)} · 红框 {meters(selected.swellTotal)}</span></div>}
+            {selected && !soloSegment && <div className="v2-selected-card"><small>当前选中</small><b>{selected.code} · {selected.type}</b><span>EPDM {meters(selected.epdmTotal)} · 红框 {meters(selected.swellTotal)}</span></div>}
             <div className="v2-model-controls">
               <button className={showEpdm ? "is-on" : ""} type="button" onClick={() => setShowEpdm((value) => !value)}><i className="v2-dot v2-dot-black" />EPDM</button>
               <button className={showSwell ? "is-on" : ""} type="button" onClick={() => setShowSwell((value) => !value)}><i className="v2-dot v2-dot-red" />红框</button>
@@ -568,19 +752,19 @@ export function UniversalShieldConfigurator() {
 
         <section className="v2-summary-grid">
           <article className="v2-stat-card"><small>管片数量</small><b>{calculated.length}</b><span>表格行数</span></article>
-          <article className={`v2-stat-card ${isClosed ? "" : "is-alert"}`}><small>中心角合计</small><b data-testid="angle-sum">{angleSum.toFixed(2)}°</b><span>{isClosed ? "闭合校验通过" : `距离 360° 还差 ${(-closureDelta).toFixed(2)}°`}</span></article>
+          <article className={`v2-stat-card ${closureIssues.length === 0 ? "" : "is-alert"}`}><small>中心角合计</small><b data-testid="angle-sum">{angleSum.toFixed(2)}°</b><span>{closureIssues.length === 0 ? "闭合校验通过" : closureIssues.join(" · ")}</span></article>
           <article className="v2-stat-card"><small><i className="v2-dot v2-dot-black" />EPDM 整环</small><b>{meters(totals.epdm)}</b><span>下料 {meters(totals.epdm / stretchFactor)}</span></article>
           <article className="v2-stat-card v2-stat-red"><small><i className="v2-dot v2-dot-red" />膨胀橡胶片整环</small><b>{meters(totals.swell)}</b><span>下料 {meters(totals.swell / stretchFactor)}</span></article>
         </section>
 
         <section className="v2-table-card v2-card">
           <div className="v2-section-heading v2-table-heading">
-            <div><small>SEGMENT INPUT TABLE</small><h2>管片数据输入表</h2><p>弧长单位为 mm；留空或填 0 时按中心角与对应中心线半径计算。</p></div>
+            <div><small>SEGMENT INPUT TABLE</small><h2>管片数据输入表</h2><p>弧长单位为 mm；留空或填 0 时按中心角与对应中心线半径计算。左/右缝偏移单位为 mm，留空按封顶块中心对称自动计算（F 两侧 = ±(F 后弧 − F 前弧) ÷ 2），填值则覆盖。</p></div>
             <div className="v2-table-actions"><button type="button" onClick={addSegment}>＋ 新增一块</button><button className="v2-primary-action" type="button" onClick={exportDetails}>↓ 导出参数与用量明细</button></div>
           </div>
           <div className="v2-table-scroll">
             <table className="v2-input-table">
-              <thead><tr><th>#</th><th>块号</th><th>类型</th><th>中心角 °</th><th>前外弧 mm</th><th>前内弧 mm</th><th>后外弧 mm</th><th>后内弧 mm</th><th>单块 EPDM</th><th>单块红框</th><th>操作</th></tr></thead>
+              <thead><tr><th>#</th><th>块号</th><th>类型</th><th>中心角 °</th><th>前外弧 mm</th><th>前内弧 mm</th><th>后外弧 mm</th><th>后内弧 mm</th><th>左缝偏移 mm</th><th>右缝偏移 mm</th><th>单块 EPDM</th><th>单块红框</th><th>操作</th></tr></thead>
               <tbody>
                 {calculated.map((segment, index) => (
                   <tr key={segment.rowId} className={selectedRowId === segment.rowId ? "is-selected" : ""} onClick={() => setSelectedRowId(segment.rowId)}>
@@ -592,6 +776,8 @@ export function UniversalShieldConfigurator() {
                     <td><input aria-label={`${segment.code} 前内弧`} type="number" step="0.1" value={segment.innerArcFront} onChange={(event) => updateSegment(segment.rowId, "innerArcFront", Number(event.target.value))} /></td>
                     <td><input aria-label={`${segment.code} 后外弧`} type="number" step="0.1" value={segment.outerArcBack} onChange={(event) => updateSegment(segment.rowId, "outerArcBack", Number(event.target.value))} /></td>
                     <td><input aria-label={`${segment.code} 后内弧`} type="number" step="0.1" value={segment.innerArcBack} onChange={(event) => updateSegment(segment.rowId, "innerArcBack", Number(event.target.value))} /></td>
+                    <td><input aria-label={`${segment.code} 左缝偏移`} type="number" step="0.1" placeholder={segment.autoLeftOffset.toFixed(1)} value={segment.wedgeOffsetLeft ?? ""} onChange={(event) => updateSegment(segment.rowId, "wedgeOffsetLeft", event.target.value === "" ? null : Number(event.target.value))} /></td>
+                    <td><input aria-label={`${segment.code} 右缝偏移`} type="number" step="0.1" placeholder={segment.autoRightOffset.toFixed(1)} value={segment.wedgeOffsetRight ?? ""} onChange={(event) => updateSegment(segment.rowId, "wedgeOffsetRight", event.target.value === "" ? null : Number(event.target.value))} /></td>
                     <td className="v2-number-cell">{meters(segment.epdmTotal)}</td>
                     <td className="v2-number-cell v2-red-number">{meters(segment.swellTotal)}</td>
                     <td><div className="v2-row-actions"><button type="button" aria-label={`复制 ${segment.code}`} onClick={(event) => { event.stopPropagation(); duplicateSegment(segment); }}>复制</button><button type="button" aria-label={`删除 ${segment.code}`} disabled={segments.length <= 1} onClick={(event) => { event.stopPropagation(); removeSegment(segment.rowId); }}>删除</button></div></td>
@@ -606,7 +792,7 @@ export function UniversalShieldConfigurator() {
           <div className="v2-section-heading"><div><small>USAGE BREAKDOWN</small><h2>逐块产品用量</h2></div><span>理论中心线长度 / 参考下料长度</span></div>
           {selected && (
             <div className="v2-edge-breakdown">
-              <div className="v2-edge-breakdown-title"><b>{selected.code} · {selected.type}</b><span>当前选中管片四边明细 · 单位 m</span></div>
+              <div className="v2-edge-breakdown-title"><b>{selected.code} · {selected.type}</b><span>四边明细 · 单位 m · 纵缝偏移 左/右 {selected.leftOffset.toFixed(1)} / {selected.rightOffset.toFixed(1)} mm · 局部环宽 {selected.leftRingWidth.toFixed(1)} / {selected.rightRingWidth.toFixed(1)} mm</span></div>
               <div className="v2-edge-grid v2-edge-grid-head"><span>边位</span><b>EPDM 黑</b><b>膨胀条 红</b></div>
               {selected.epdmEdges.map((edge, index) => (
                 <div className="v2-edge-grid" key={edge.code}>

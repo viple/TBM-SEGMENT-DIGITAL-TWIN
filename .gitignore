@@ -38,3 +38,8 @@ yarn-error.log*
 /.wrangler/
 /outputs/
 /work/
+
+# 工作区临时产物（dsh-webui 自动清理）
+_tmp/
+# TypeScript 增量构建缓存
+tsconfig.tsbuildinfo

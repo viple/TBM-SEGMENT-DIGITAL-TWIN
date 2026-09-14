@@ -44,9 +44,25 @@ export default defineConfig(async () => {
   const { cloudflare } = await import("@cloudflare/vite-plugin");
 
   return {
-    server: isCodexSeatbeltSandbox
-      ? { watch: { useFsEvents: false, usePolling: true } }
-      : undefined,
+    server: {
+      watch: {
+        // macOS Seatbelt blocks FSEvents, so Codex previews need polling for HMR.
+        ...(isCodexSeatbeltSandbox
+          ? { useFsEvents: false, usePolling: true }
+          : {}),
+        // Editors (e.g. the DSH GUI) save files atomically via a locked temp dir
+        // like `.File.tsx.<pid>.<uuid>.tmpdir/File.tsx.tmp`. Watching that locked
+        // file crashes the watcher with EBUSY on Windows, so ignore those temp
+        // artifacts (keeping Vite's built-in ignores: .git, node_modules, etc.).
+        ignored: [
+          "**/.git/**",
+          "**/node_modules/**",
+          "**/test-results/**",
+          "**/.*.tmpdir/**",
+          "**/*.tmp",
+        ],
+      },
+    },
     plugins: [
       vinext(),
       sites(),

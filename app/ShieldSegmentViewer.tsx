@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { downloadCsv, type CsvValue } from "./lib/csv";
+import { buildProductFrame, buildSegmentGeometry } from "./lib/segmentGeometry";
 
 type SegmentDefinition = {
   id: string;
@@ -41,8 +42,8 @@ const SWELL_DISPLAY_HEIGHT = 0.01;
 const SEGMENTS: SegmentDefinition[] = [
   { id: "B3", type: "标准块", start: -33.75, end: 33.75, angle: 67.5, color: 0xcfd5d5, explodeOrder: 4, outerArcFront: 3.6521, innerArcFront: 3.2398, outerArcBack: 3.6521, innerArcBack: 3.2398 },
   { id: "B2", type: "标准块", start: 33.75, end: 101.25, angle: 67.5, color: 0xbec8c7, explodeOrder: 3, outerArcFront: 3.6521, innerArcFront: 3.2398, outerArcBack: 3.6521, innerArcBack: 3.2398 },
-  { id: "L2", type: "邻接块", start: 101.25, end: 170, angle: 68.75, color: 0xd8b46c, explodeOrder: 1, outerArcFront: 3.6849, innerArcFront: 3.2403, outerArcBack: 3.8032, innerArcBack: 3.3589 },
-  { id: "F", type: "封顶块", start: 170, end: 190, angle: 20, color: 0xe56f51, explodeOrder: 0, outerArcFront: 1.1518, innerArcFront: 1.0789, outerArcBack: 0.9151, innerArcBack: 0.8416 },
+  { id: "L2", type: "邻接块", start: 101.25, end: 170, angle: 68.75, color: 0xd8b46c, explodeOrder: 1, outerArcFront: 3.8032, innerArcFront: 3.3589, outerArcBack: 3.6849, innerArcBack: 3.2403 },
+  { id: "F", type: "封顶块", start: 170, end: 190, angle: 20, color: 0xe56f51, explodeOrder: 0, outerArcFront: 0.9151, innerArcFront: 0.8416, outerArcBack: 1.1518, innerArcBack: 1.0789 },
   { id: "L1", type: "邻接块", start: 190, end: 258.75, angle: 68.75, color: 0xd8a968, explodeOrder: 2, outerArcFront: 3.8032, innerArcFront: 3.3589, outerArcBack: 3.6849, innerArcBack: 3.2403 },
   { id: "B1", type: "标准块", start: 258.75, end: 326.25, angle: 67.5, color: 0xc7cfce, explodeOrder: 5, outerArcFront: 3.6521, innerArcFront: 3.2398, outerArcBack: 3.6521, innerArcBack: 3.2398 },
 ];
@@ -51,6 +52,22 @@ const toRadians = (degrees: number) => THREE.MathUtils.degToRad(degrees);
 const clamp = (value: number, min = 0, max = 1) => Math.min(max, Math.max(min, value));
 const easeInOut = (value: number) => value * value * (3 - 2 * value);
 
+/** 楔形量（演示值 40 mm）：双面楔形，最小环宽在封顶块对称中心线 */
+const WEDGE_AMOUNT = 0.04;
+
+// 前端接缝角位（度）：按前外弧/外半径沿环累加，保证整环前端面无缝闭合
+const FRONT_JOINT_ANGLES: number[] = (() => {
+  const angles = [SEGMENTS[0].start];
+  for (const definition of SEGMENTS) {
+    angles.push(angles[angles.length - 1] + (definition.outerArcFront / OUTER_RADIUS) * (180 / Math.PI));
+  }
+  return angles;
+})();
+const KEY_INDEX = Math.max(0, SEGMENTS.findIndex((definition) => definition.type.includes("封顶")));
+const KEY_ANGLE = toRadians((FRONT_JOINT_ANGLES[KEY_INDEX] + FRONT_JOINT_ANGLES[KEY_INDEX + 1]) / 2);
+/** 局部环宽（米）：B(θ) = 环宽 − (楔形量/2)·cos(θ − θK)，最小环宽在封顶块中心线 */
+const ringWidthAt = (angleDeg: number) => RING_WIDTH - (WEDGE_AMOUNT / 2) * Math.cos(toRadians(angleDeg) - KEY_ANGLE);
+
 const interpolatedArc = (definition: SegmentDefinition, radius: number, face: "front" | "back") => {
   const ratio = (radius - INNER_RADIUS) / (OUTER_RADIUS - INNER_RADIUS);
   const inner = face === "front" ? definition.innerArcFront : definition.innerArcBack;
@@ -58,99 +75,46 @@ const interpolatedArc = (definition: SegmentDefinition, radius: number, face: "f
   return inner + (outer - inner) * ratio;
 };
 
-const frameEdges = (definition: SegmentDefinition, radius: number) => [
-  { code: "①", name: "前环缝弧边", length: interpolatedArc(definition, radius, "front") },
-  { code: "②", name: "右纵缝直边", length: RING_WIDTH },
-  { code: "③", name: "后环缝弧边", length: interpolatedArc(definition, radius, "back") },
-  { code: "④", name: "左纵缝直边", length: RING_WIDTH },
-];
+// 楔形偏移默认以封顶块中心线对称：F 两侧偏移 = ±(F 后弧 − F 前弧) / 2，再沿环向两侧传播。
+// 相邻块共享同一接缝偏移；成环要求前弧长总和等于后弧长总和，否则首尾接缝偏移回不到 0。
+const jointOffsets = (radius: number) => {
+  const arcs = SEGMENTS.map((definition) => ({
+    front: interpolatedArc(definition, radius, "front"),
+    back: interpolatedArc(definition, radius, "back"),
+  }));
+  const keyIndex = Math.max(0, SEGMENTS.findIndex((definition) => definition.type.includes("封顶")));
+  const half = (arcs[keyIndex].back - arcs[keyIndex].front) / 2;
+  const offsets = new Array<number>(SEGMENTS.length + 1);
+  offsets[keyIndex] = -half;
+  offsets[keyIndex + 1] = half;
+  for (let index = keyIndex - 1; index >= 0; index -= 1) {
+    offsets[index] = offsets[index + 1] - (arcs[index].back - arcs[index].front);
+  }
+  for (let index = keyIndex + 1; index < SEGMENTS.length; index += 1) {
+    offsets[index + 1] = offsets[index] + (arcs[index].back - arcs[index].front);
+  }
+  return offsets;
+};
 
-const theoreticalLength = (definition: SegmentDefinition, radius: number) =>
-  frameEdges(definition, radius).reduce((sum, edge) => sum + edge.length, 0);
+const frameEdges = (definition: SegmentDefinition, radius: number, index: number) => {
+  const offsets = jointOffsets(radius);
+  const front = interpolatedArc(definition, radius, "front");
+  const back = interpolatedArc(definition, radius, "back");
+  // 纵缝直边 = √(局部环宽² + 接缝偏移²)；局部环宽取该缝前端接缝角位处
+  const leftSeam = Math.hypot(ringWidthAt(FRONT_JOINT_ANGLES[index]), offsets[index]);
+  const rightSeam = Math.hypot(ringWidthAt(FRONT_JOINT_ANGLES[index + 1]), offsets[index + 1]);
+  return [
+    { code: "①", name: "前环缝弧边", length: front },
+    { code: "②", name: "右纵缝直边", length: rightSeam },
+    { code: "③", name: "后环缝弧边", length: back },
+    { code: "④", name: "左纵缝直边", length: leftSeam },
+  ];
+};
+
+const theoreticalLength = (definition: SegmentDefinition, radius: number, index: number) =>
+  frameEdges(definition, radius, index).reduce((sum, edge) => sum + edge.length, 0);
 
 const meters = (value: number) => `${value.toFixed(3)} m`;
-
-function annularShape(inner: number, outer: number, start: number, end: number) {
-  const shape = new THREE.Shape();
-  const s = toRadians(start);
-  const e = toRadians(end);
-  shape.moveTo(outer * Math.cos(s), outer * Math.sin(s));
-  shape.absarc(0, 0, outer, s, e, false);
-  shape.lineTo(inner * Math.cos(e), inner * Math.sin(e));
-  shape.absarc(0, 0, inner, e, s, true);
-  shape.closePath();
-  return shape;
-}
-
-function sectorGeometry(
-  inner: number,
-  outer: number,
-  start: number,
-  end: number,
-  depth: number,
-  bevel = false,
-) {
-  const geometry = new THREE.ExtrudeGeometry(annularShape(inner, outer, start, end), {
-    depth,
-    bevelEnabled: bevel,
-    bevelSegments: bevel ? 2 : 0,
-    bevelSize: bevel ? 0.008 : 0,
-    bevelThickness: bevel ? 0.008 : 0,
-    curveSegments: Math.max(32, Math.ceil((end - start) * 1.2)),
-  });
-  geometry.translate(0, 0, -depth / 2);
-  geometry.computeVertexNormals();
-  return geometry;
-}
-
-function productFrame(
-  radius: number,
-  radialWidth: number,
-  height: number,
-  definition: SegmentDefinition,
-  color: number,
-  emissive: number,
-) {
-  const group = new THREE.Group();
-  const material = new THREE.MeshPhysicalMaterial({
-    color,
-    emissive,
-    emissiveIntensity: 0.18,
-    roughness: 0.62,
-    metalness: 0.02,
-    clearcoat: 0.18,
-  });
-
-  const front = new THREE.Mesh(
-    sectorGeometry(
-      radius - radialWidth / 2,
-      radius + radialWidth / 2,
-      definition.start,
-      definition.end,
-      height,
-    ),
-    material,
-  );
-  front.position.z = RING_WIDTH / 2 + height / 2 + 0.003;
-  group.add(front);
-
-  const back = front.clone();
-  back.position.z = -RING_WIDTH / 2 - height / 2 - 0.003;
-  group.add(back);
-
-  [definition.start, definition.end].forEach((angle) => {
-    const rad = toRadians(angle);
-    const endBar = new THREE.Mesh(
-      new THREE.BoxGeometry(radialWidth, height, RING_WIDTH + height * 2 + 0.012),
-      material,
-    );
-    endBar.position.set(radius * Math.cos(rad), radius * Math.sin(rad), 0);
-    endBar.rotation.z = rad;
-    group.add(endBar);
-  });
-
-  return group;
-}
 
 function textSprite(label: string) {
   const canvas = document.createElement("canvas");
@@ -206,13 +170,14 @@ export function ShieldSegmentViewer() {
   const [stretchRate, setStretchRate] = useState(0);
 
   const selectedDefinition = SEGMENTS.find((segment) => segment.id === selected) ?? SEGMENTS[0];
-  const selectedEpdm = theoreticalLength(selectedDefinition, EPDM_RADIUS);
-  const selectedSwell = theoreticalLength(selectedDefinition, SWELL_RADIUS);
+  const selectedIndex = SEGMENTS.indexOf(selectedDefinition);
+  const selectedEpdm = theoreticalLength(selectedDefinition, EPDM_RADIUS, selectedIndex);
+  const selectedSwell = theoreticalLength(selectedDefinition, SWELL_RADIUS, selectedIndex);
 
   const totals = useMemo(
     () => ({
-      epdm: SEGMENTS.reduce((sum, segment) => sum + theoreticalLength(segment, EPDM_RADIUS), 0),
-      swell: SEGMENTS.reduce((sum, segment) => sum + theoreticalLength(segment, SWELL_RADIUS), 0),
+      epdm: SEGMENTS.reduce((sum, segment, index) => sum + theoreticalLength(segment, EPDM_RADIUS, index), 0),
+      swell: SEGMENTS.reduce((sum, segment, index) => sum + theoreticalLength(segment, SWELL_RADIUS, index), 0),
     }),
     [],
   );
@@ -222,7 +187,8 @@ export function ShieldSegmentViewer() {
   const exportUsageDetails = () => {
     const rows: CsvValue[][] = [
       ["WC06C 盾构管片密封产品用量明细表（Demo）"],
-      ["计算口径", "密封点中心线理论长度；参考下料长度 = 理论长度 ÷（1 + 安装拉伸率）"],
+      ["计算口径", "楔形环（双面楔形）密封点中心线理论长度；纵缝直边 = √(局部环宽² + 接缝偏移²)；参考下料长度 = 理论长度 ÷（1 + 安装拉伸率）"],
+      ["楔形量", "40 mm（最小环宽在封顶块中心线）"],
       ["安装拉伸率", `${stretchRate.toFixed(1)}%`],
       [],
       ["记录类型", "块号", "管片类型", "中心角(°)", "产品", "规格(mm)", "边位", "边名称", "理论长度(m)", "参考下料(m)"],
@@ -233,7 +199,7 @@ export function ShieldSegmentViewer() {
         { product: "EPDM 弹性密封垫", spec: "35 × 16.5", radius: EPDM_RADIUS },
         { product: "遇水膨胀橡胶片", spec: "4 × 25", radius: SWELL_RADIUS },
       ].forEach(({ product, spec, radius }) => {
-        const edges = frameEdges(segment, radius);
+        const edges = frameEdges(segment, radius, SEGMENTS.indexOf(segment));
         const subtotal = edges.reduce((sum, edge) => sum + edge.length, 0);
         rows.push(["单块小计", segment.id, segment.type, segment.angle.toFixed(2), product, spec, "闭合框", "四边合计", subtotal.toFixed(3), (subtotal / cutFactor).toFixed(3)]);
         edges.forEach((edge) => {
@@ -325,7 +291,10 @@ export function ShieldSegmentViewer() {
     halo.position.z = -RING_WIDTH / 2 - 0.25;
     scene.add(halo);
 
-    const runtime: RuntimeSegment[] = SEGMENTS.map((definition) => {
+    const epdmOffsets = jointOffsets(EPDM_RADIUS);
+    const swellOffsets = jointOffsets(SWELL_RADIUS);
+
+    const runtime: RuntimeSegment[] = SEGMENTS.map((definition, index) => {
       const group = new THREE.Group();
       const material = new THREE.MeshPhysicalMaterial({
         color: definition.color,
@@ -335,13 +304,22 @@ export function ShieldSegmentViewer() {
         emissive: 0x000000,
         emissiveIntensity: 0,
       });
-      const geometry = sectorGeometry(
+      const frontStart = toRadians(FRONT_JOINT_ANGLES[index]);
+      const frontEnd = toRadians(FRONT_JOINT_ANGLES[index + 1]);
+      const backStart = frontStart + epdmOffsets[index] / EPDM_RADIUS;
+      const backEnd = frontEnd + epdmOffsets[index + 1] / EPDM_RADIUS;
+      const swellBackStart = frontStart + swellOffsets[index] / SWELL_RADIUS;
+      const swellBackEnd = frontEnd + swellOffsets[index + 1] / SWELL_RADIUS;
+      const geometry = buildSegmentGeometry(
         INNER_RADIUS,
         OUTER_RADIUS,
-        definition.start,
-        definition.end,
+        frontStart,
+        frontEnd,
+        backStart,
+        backEnd,
         RING_WIDTH,
-        true,
+        WEDGE_AMOUNT,
+        KEY_ANGLE,
       );
       const body = new THREE.Mesh(geometry, material);
       body.castShadow = true;
@@ -355,18 +333,26 @@ export function ShieldSegmentViewer() {
       );
       group.add(edges);
 
-      const epdm = productFrame(EPDM_RADIUS, 0.035, 0.0165, definition, 0x050607, 0x1a1d1e);
-      const swell = productFrame(
+      const epdm = buildProductFrame(EPDM_RADIUS, 0.035, 0.0165, RING_WIDTH, OUTER_RADIUS, WEDGE_AMOUNT, KEY_ANGLE, frontStart, frontEnd, backStart, backEnd, 0x050607, 0x1a1d1e, 0.16);
+      const swell = buildProductFrame(
         SWELL_DISPLAY_RADIUS,
         SWELL_DISPLAY_WIDTH,
         SWELL_DISPLAY_HEIGHT,
-        definition,
+        RING_WIDTH,
+        OUTER_RADIUS,
+        WEDGE_AMOUNT,
+        KEY_ANGLE,
+        frontStart,
+        frontEnd,
+        swellBackStart,
+        swellBackEnd,
         0xff3b32,
         0x8f0c08,
+        0.34,
       );
       group.add(epdm, swell);
 
-      const center = toRadians((definition.start + definition.end) / 2);
+      const center = toRadians((FRONT_JOINT_ANGLES[index] + FRONT_JOINT_ANGLES[index + 1]) / 2);
       const label = textSprite(definition.id);
       label.position.set(2.91 * Math.cos(center), 2.91 * Math.sin(center), RING_WIDTH / 2 + 0.17);
       group.add(label);
@@ -517,7 +503,10 @@ export function ShieldSegmentViewer() {
         }
         item.epdm.visible = settingsRef.current.showEpdm;
         item.swell.visible = settingsRef.current.showSwell;
-        item.body.material.opacity = settingsRef.current.fullTransparent ? 0 : settingsRef.current.transparent ? 0.42 : 1;
+        // 单块观察时强制半透明，便于查看两种密封产品的闭合框（退出后恢复用户设置）
+        const soloOpacity = solo ? 0.35 : settingsRef.current.fullTransparent ? 0 : settingsRef.current.transparent ? 0.42 : 1;
+        item.body.material.opacity = soloOpacity;
+        item.body.material.transparent = soloOpacity < 1;
         item.edges.visible = !settingsRef.current.fullTransparent;
       });
 
@@ -591,6 +580,7 @@ export function ShieldSegmentViewer() {
           <span><b>Ø6200</b> 外径</span>
           <span><b>350 mm</b> 厚度</span>
           <span><b>1200 mm</b> 环宽</span>
+          <span><b>40 mm</b> 楔形量</span>
           <span className="status-chip"><i /> 第一版模型</span>
         </div>
       </header>
@@ -694,7 +684,7 @@ export function ShieldSegmentViewer() {
           {tooltip.visible && hoverDefinition && (
             <div className="hover-card" style={{ left: tooltip.x, top: tooltip.y }}>
               <strong>{hoverDefinition.id} · {hoverDefinition.type}</strong>
-              <span>{hoverDefinition.angle.toFixed(2)}° · EPDM {meters(theoreticalLength(hoverDefinition, EPDM_RADIUS))} · 红框 {meters(theoreticalLength(hoverDefinition, SWELL_RADIUS))}</span>
+              <span>{hoverDefinition.angle.toFixed(2)}° · EPDM {meters(theoreticalLength(hoverDefinition, EPDM_RADIUS, SEGMENTS.indexOf(hoverDefinition)))} · 红框 {meters(theoreticalLength(hoverDefinition, SWELL_RADIUS, SEGMENTS.indexOf(hoverDefinition)))}</span>
               <em>双击进入单块观察</em>
             </div>
           )}
@@ -720,6 +710,8 @@ export function ShieldSegmentViewer() {
             <div><span>外半径</span><b>3100 mm</b></div>
             <div><span>内半径</span><b>2750 mm</b></div>
             <div><span>环宽</span><b>1200 mm</b></div>
+            <div><span>楔形量</span><b>{(WEDGE_AMOUNT * 1000).toFixed(0)} mm</b></div>
+            <div><span>最小环宽</span><b>{(ringWidthAt((FRONT_JOINT_ANGLES[KEY_INDEX] + FRONT_JOINT_ANGLES[KEY_INDEX + 1]) / 2) * 1000).toFixed(1)} mm</b></div>
           </div>
 
           <div className="length-card epdm-card">
@@ -735,15 +727,18 @@ export function ShieldSegmentViewer() {
 
           <div className="edge-accordion" aria-label="各管片四边长度">
             <div className="edge-section-title"><span>各块四边长度</span><small>点击展开 · 单位 m</small></div>
-            {SEGMENTS.slice().sort((a, b) => a.explodeOrder - b.explodeOrder).map((segment) => {
-              const epdmEdges = frameEdges(segment, EPDM_RADIUS);
-              const swellEdges = frameEdges(segment, SWELL_RADIUS);
+            {(() => {
+              const epdmOffsets = jointOffsets(EPDM_RADIUS);
+              return SEGMENTS.slice().sort((a, b) => a.explodeOrder - b.explodeOrder).map((segment) => {
+                const segmentIndex = SEGMENTS.indexOf(segment);
+                const epdmEdges = frameEdges(segment, EPDM_RADIUS, segmentIndex);
+                const swellEdges = frameEdges(segment, SWELL_RADIUS, segmentIndex);
               return (
                 <details key={segment.id} open={selected === segment.id}>
                   <summary onClick={() => setSelected(segment.id)}>
                     <span>{segment.id}</span>
                     <i>{segment.type}</i>
-                    <b>{meters(theoreticalLength(segment, EPDM_RADIUS))}</b>
+                    <b>{meters(theoreticalLength(segment, EPDM_RADIUS, segmentIndex))}</b>
                   </summary>
                   <div className="edge-table">
                     <div className="edge-table-head"><span>边位</span><b>EPDM 黑</b><b>膨胀条 红</b></div>
@@ -758,16 +753,19 @@ export function ShieldSegmentViewer() {
                       <span>管片弧边参考</span>
                       <small>外弧 前/后 {segment.outerArcFront.toFixed(3)} / {segment.outerArcBack.toFixed(3)}</small>
                       <small>内弧 前/后 {segment.innerArcFront.toFixed(3)} / {segment.innerArcBack.toFixed(3)}</small>
+                      <small>纵缝偏移 左/右 {(epdmOffsets[segmentIndex] * 1000).toFixed(1)} / {(epdmOffsets[segmentIndex + 1] * 1000).toFixed(1)} mm</small>
+                      <small>局部环宽 左/右 {(ringWidthAt(FRONT_JOINT_ANGLES[segmentIndex]) * 1000).toFixed(1)} / {(ringWidthAt(FRONT_JOINT_ANGLES[segmentIndex + 1]) * 1000).toFixed(1)} mm</small>
                     </div>
                   </div>
                 </details>
               );
-            })}
+            });
+            })()}
           </div>
 
           <div className="formula-note">
             <span>计算口径</span>
-            <p>两种闭合框的弧边均按模板图内外弧插值得到中心线长度，直边暂按 1200 mm；转角按 90° 理论交点。红色框在三维显示中适度放大并移到端面外缘，长度仍按 4 × 25 mm 产品中心线实尺计算。</p>
+            <p>两种闭合框的弧边均按模板图内外弧插值得到中心线长度；楔形环（双面楔形，楔形量 40 mm，最小环宽在封顶块中心线）局部环宽 B(θ) = 1200 − 20·cos(θ − 180°)，纵缝直边 = √(B(θ)² + 接缝偏移²)，接缝偏移默认以封顶块中心对称（F 两侧 = ±(F 后弧 − F 前弧) ÷ 2）沿环向两侧传播，相邻块共享同一接缝；转角按 90° 理论交点。三维模型按前后弧差与楔形真实放样。红色框在三维显示中适度放大并移到端面外缘，长度仍按 4 × 25 mm 产品中心线实尺计算。</p>
           </div>
 
           <button className="export-detail-button" onClick={exportUsageDetails} type="button">
