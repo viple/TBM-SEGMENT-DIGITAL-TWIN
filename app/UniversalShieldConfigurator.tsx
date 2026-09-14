@@ -3,76 +3,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { downloadCsv, type CsvValue } from "./lib/csv";
+import { downloadCsv, downloadJson, safeFileName, type CsvValue } from "./lib/download";
 import { buildProductFrame, buildSegmentGeometry } from "./lib/segmentGeometry";
-
-type RingParameters = {
-  projectName: string;
-  outerDiameter: number;
-  innerDiameter: number;
-  ringWidth: number;
-  /** 楔形量(mm)：双面楔形，最小环宽在封顶块对称中心线，0 = 等宽环 */
-  wedgeAmount: number;
-  startAngle: number;
-  stretchRate: number;
-};
-
-type ProductParameters = {
-  centerRadius: number;
-  width: number;
-  height: number;
-};
-
-type ProductSet = {
-  epdm: ProductParameters;
-  swell: ProductParameters;
-};
-
-type SegmentInput = {
-  rowId: string;
-  code: string;
-  type: string;
-  angle: number;
-  outerArcFront: number;
-  innerArcFront: number;
-  outerArcBack: number;
-  innerArcBack: number;
-  /** 左缝楔形偏移(mm)，空 = 自动按封顶块中心对称计算 */
-  wedgeOffsetLeft?: number | null;
-  /** 右缝楔形偏移(mm)，空 = 自动按封顶块中心对称计算 */
-  wedgeOffsetRight?: number | null;
-};
-
-type EdgeLength = {
-  code: string;
-  name: string;
-  length: number;
-};
-
-type CalculatedSegment = SegmentInput & {
-  /** 前端面角位（度，由前外弧沿环累加） */
-  start: number;
-  end: number;
-  /** 后端面角位（度，接缝偏移错位后，EPDM 中心线半径定义） */
-  backStart: number;
-  backEnd: number;
-  /** 后端面角位（度，遇水膨胀橡胶片中心线半径定义） */
-  swellBackStart: number;
-  swellBackEnd: number;
-  /** 左/右接缝处的局部环宽(mm)：B(θ) = 环宽 − (楔形量/2)·cos(θ − θK) */
-  leftRingWidth: number;
-  rightRingWidth: number;
-  /** 自动计算的左/右缝偏移(mm，EPDM 中心线半径处) */
-  autoLeftOffset: number;
-  autoRightOffset: number;
-  /** 生效的左/右缝偏移(mm，手动值优先) */
-  leftOffset: number;
-  rightOffset: number;
-  epdmEdges: EdgeLength[];
-  swellEdges: EdgeLength[];
-  epdmTotal: number;
-  swellTotal: number;
-};
+import {
+  buildUsagePayload, calculateSegments, cloneSegments, DEFAULT_PRODUCTS, DEFAULT_RING, DEFAULT_SEGMENTS,
+  stretchFactorOf, toRadians, validateUsage,
+  type ProductParameters, type ProductSet, type RingParameters, type SegmentInput,
+} from "./lib/segmentUsage";
 
 type RuntimeSegment = {
   rowId: string;
@@ -81,178 +18,8 @@ type RuntimeSegment = {
   center: number;
   order: number;
 };
-
-const DEFAULT_RING: RingParameters = {
-  projectName: "WC06C 衬砌圆环",
-  outerDiameter: 6200,
-  innerDiameter: 5500,
-  ringWidth: 1200,
-  wedgeAmount: 0,
-  startAngle: -33.75,
-  stretchRate: 0,
-};
-
-const DEFAULT_PRODUCTS: ProductSet = {
-  epdm: { centerRadius: 3039, width: 35, height: 16.5 },
-  swell: { centerRadius: 3069, width: 25, height: 4 },
-};
-
-const DEFAULT_SEGMENTS: SegmentInput[] = [
-  { rowId: "wc-b3", code: "B3", type: "标准块", angle: 67.5, outerArcFront: 3652.1, innerArcFront: 3239.8, outerArcBack: 3652.1, innerArcBack: 3239.8 },
-  { rowId: "wc-b2", code: "B2", type: "标准块", angle: 67.5, outerArcFront: 3652.1, innerArcFront: 3239.8, outerArcBack: 3652.1, innerArcBack: 3239.8 },
-  { rowId: "wc-l2", code: "L2", type: "邻接块", angle: 68.75, outerArcFront: 3803.2, innerArcFront: 3358.9, outerArcBack: 3684.9, innerArcBack: 3240.3 },
-  { rowId: "wc-f", code: "F", type: "封顶块", angle: 20, outerArcFront: 915.1, innerArcFront: 841.6, outerArcBack: 1151.8, innerArcBack: 1078.9 },
-  { rowId: "wc-l1", code: "L1", type: "邻接块", angle: 68.75, outerArcFront: 3803.2, innerArcFront: 3358.9, outerArcBack: 3684.9, innerArcBack: 3240.3 },
-  { rowId: "wc-b1", code: "B1", type: "标准块", angle: 67.5, outerArcFront: 3652.1, innerArcFront: 3239.8, outerArcBack: 3652.1, innerArcBack: 3239.8 },
-];
-
 const SEGMENT_COLORS = [0xc9d1d0, 0xbac7c5, 0xd7b16c, 0xe57856, 0xd4a768, 0xc4cecc, 0x8eaaa9, 0xb79b78];
-const toRadians = (degrees: number) => THREE.MathUtils.degToRad(degrees);
 const meters = (millimeters: number) => `${(millimeters / 1000).toFixed(3)} m`;
-const cloneSegments = () => DEFAULT_SEGMENTS.map((segment) => ({ ...segment }));
-const safeNumber = (value: number, fallback = 0) => Number.isFinite(value) ? value : fallback;
-
-function interpolatedArc(
-  segment: SegmentInput,
-  centerRadius: number,
-  innerRadius: number,
-  outerRadius: number,
-  face: "front" | "back",
-) {
-  const innerArc = face === "front" ? segment.innerArcFront : segment.innerArcBack;
-  const outerArc = face === "front" ? segment.outerArcFront : segment.outerArcBack;
-  if (innerArc > 0 && outerArc > 0 && outerRadius > innerRadius) {
-    const ratio = (centerRadius - innerRadius) / (outerRadius - innerRadius);
-    return innerArc + (outerArc - innerArc) * ratio;
-  }
-  return centerRadius * toRadians(Math.max(0, segment.angle));
-}
-
-// 楔形偏移默认以封顶块中心线对称：F 两侧偏移 = ±(F 后弧 − F 前弧) / 2（产品中心线半径处），
-// 再沿环向两侧传播：左接缝偏移 = 右接缝偏移 − (后弧 − 前弧)。相邻块共享同一接缝偏移。
-function autoWedgeOffsets(
-  segments: SegmentInput[],
-  centerRadius: number,
-  innerRadius: number,
-  outerRadius: number,
-) {
-  const arcs = segments.map((segment) => ({
-    front: interpolatedArc(segment, centerRadius, innerRadius, outerRadius, "front"),
-    back: interpolatedArc(segment, centerRadius, innerRadius, outerRadius, "back"),
-  }));
-  const keyIndex = Math.max(0, segments.findIndex((segment) => (segment.type ?? "").includes("封顶")));
-  const half = (arcs[keyIndex].back - arcs[keyIndex].front) / 2;
-  const offsets = new Array<number>(segments.length + 1);
-  offsets[keyIndex] = -half;
-  offsets[keyIndex + 1] = half;
-  for (let index = keyIndex - 1; index >= 0; index -= 1) {
-    offsets[index] = offsets[index + 1] - (arcs[index].back - arcs[index].front);
-  }
-  for (let index = keyIndex + 1; index < segments.length; index += 1) {
-    offsets[index + 1] = offsets[index] + (arcs[index].back - arcs[index].front);
-  }
-  return offsets;
-}
-
-function resolveWedgeOffsets(segments: SegmentInput[], autoOffsets: number[]) {
-  return segments.map((segment, index) => ({
-    left: segment.wedgeOffsetLeft == null ? autoOffsets[index] : safeNumber(segment.wedgeOffsetLeft),
-    right: segment.wedgeOffsetRight == null ? autoOffsets[index + 1] : safeNumber(segment.wedgeOffsetRight),
-  }));
-}
-
-function arcClosureStatus(segments: SegmentInput[]) {
-  const frontOuter = segments.reduce((sum, segment) => sum + safeNumber(segment.outerArcFront), 0);
-  const backOuter = segments.reduce((sum, segment) => sum + safeNumber(segment.outerArcBack), 0);
-  const frontInner = segments.reduce((sum, segment) => sum + safeNumber(segment.innerArcFront), 0);
-  const backInner = segments.reduce((sum, segment) => sum + safeNumber(segment.innerArcBack), 0);
-  const applicable = frontOuter > 0 || backOuter > 0 || frontInner > 0 || backInner > 0;
-  const error = Math.max(Math.abs(frontOuter - backOuter), Math.abs(frontInner - backInner));
-  return { applicable, error };
-}
-
-function productEdges(
-  segment: SegmentInput,
-  resolved: { left: number; right: number },
-  leftRingWidth: number,
-  rightRingWidth: number,
-  centerRadius: number,
-  ring: RingParameters,
-) {
-  const outerRadius = ring.outerDiameter / 2;
-  const innerRadius = ring.innerDiameter / 2;
-  const frontArc = interpolatedArc(segment, centerRadius, innerRadius, outerRadius, "front");
-  const backArc = interpolatedArc(segment, centerRadius, innerRadius, outerRadius, "back");
-  return [
-    { code: "①", name: "前环缝弧边", length: frontArc },
-    { code: "②", name: "右纵缝直边", length: Math.hypot(rightRingWidth, resolved.right) },
-    { code: "③", name: "后环缝弧边", length: backArc },
-    { code: "④", name: "左纵缝直边", length: Math.hypot(leftRingWidth, resolved.left) },
-  ];
-}
-
-function calculateSegments(segments: SegmentInput[], ring: RingParameters, products: ProductSet) {
-  const innerRadius = ring.innerDiameter / 2;
-  const outerRadius = ring.outerDiameter / 2;
-  // 前端接缝角位（度）由前外弧沿环累加（前外弧留空/为 0 时按中心角），保证前端面无缝闭合
-  const spans = segments.map((segment) => {
-    const outerArc = safeNumber(segment.outerArcFront);
-    if (outerArc > 0 && outerRadius > 0) return (outerArc / outerRadius) * (180 / Math.PI);
-    return Math.max(0, safeNumber(segment.angle));
-  });
-  const frontStarts: number[] = [];
-  let cursor = ring.startAngle;
-  spans.forEach((span) => {
-    frontStarts.push(cursor);
-    cursor += span;
-  });
-  // 局部环宽 B(θ) = 环宽 − (楔形量/2)·cos(θ − θK)，θK 为封顶块前端中心角位（最小环宽处）
-  const keyIndex = Math.max(0, segments.findIndex((segment) => (segment.type ?? "").includes("封顶")));
-  const keyAngle = toRadians(frontStarts[keyIndex] + spans[keyIndex] / 2);
-  const wedge = Math.min(Math.max(safeNumber(ring.wedgeAmount), 0), ring.ringWidth);
-  const ringWidthAt = (angleDeg: number) => ring.ringWidth - (wedge / 2) * Math.cos(toRadians(angleDeg) - keyAngle);
-  const epdmAuto = autoWedgeOffsets(segments, products.epdm.centerRadius, innerRadius, outerRadius);
-  const swellAuto = autoWedgeOffsets(segments, products.swell.centerRadius, innerRadius, outerRadius);
-  const epdmResolved = resolveWedgeOffsets(segments, epdmAuto);
-  const swellResolved = resolveWedgeOffsets(segments, swellAuto);
-  const epdmRadius = products.epdm.centerRadius;
-  const swellRadius = products.swell.centerRadius;
-  return segments.map<CalculatedSegment>((segment, index) => {
-    const angle = Math.max(0, safeNumber(segment.angle));
-    const start = frontStarts[index];
-    const end = start + spans[index];
-    const leftOffset = epdmResolved[index].left;
-    const rightOffset = epdmResolved[index].right;
-    const backStart = start + (leftOffset / epdmRadius) * (180 / Math.PI);
-    const backEnd = end + (rightOffset / epdmRadius) * (180 / Math.PI);
-    const swellBackStart = start + (swellResolved[index].left / swellRadius) * (180 / Math.PI);
-    const swellBackEnd = end + (swellResolved[index].right / swellRadius) * (180 / Math.PI);
-    const leftRingWidth = ringWidthAt(start);
-    const rightRingWidth = ringWidthAt(end);
-    const epdmEdges = productEdges(segment, epdmResolved[index], leftRingWidth, rightRingWidth, products.epdm.centerRadius, ring);
-    const swellEdges = productEdges(segment, swellResolved[index], leftRingWidth, rightRingWidth, products.swell.centerRadius, ring);
-    return {
-      ...segment,
-      angle,
-      start,
-      end,
-      backStart,
-      backEnd,
-      swellBackStart,
-      swellBackEnd,
-      leftRingWidth,
-      rightRingWidth,
-      autoLeftOffset: epdmAuto[index],
-      autoRightOffset: epdmAuto[index + 1],
-      leftOffset,
-      rightOffset,
-      epdmEdges,
-      swellEdges,
-      epdmTotal: epdmEdges.reduce((sum, edge) => sum + edge.length, 0),
-      swellTotal: swellEdges.reduce((sum, edge) => sum + edge.length, 0),
-    };
-  });
-}
 
 function textSprite(label: string) {
   const canvas = document.createElement("canvas");
@@ -316,27 +83,11 @@ export function UniversalShieldConfigurator() {
   const soloRef = useRef<string | null>(null);
 
   const calculated = useMemo(() => calculateSegments(segments, ring, products), [segments, ring, products]);
-  const angleSum = calculated.reduce((sum, segment) => sum + segment.angle, 0);
-  const closureDelta = angleSum - 360;
-  const isClosed = Math.abs(closureDelta) <= 0.05;
-  const arcClosure = arcClosureStatus(segments);
-  const isArcClosed = !arcClosure.applicable || arcClosure.error <= 0.5;
-  // 相邻块共享同一接缝：左缝偏移(块 k) 应与右缝偏移(块 k−1) 一致，含首尾接缝
-  const seamIssues: string[] = [];
-  calculated.forEach((segment, index) => {
-    const neighbor = calculated[(index - 1 + calculated.length) % calculated.length];
-    const delta = Math.abs(segment.leftOffset - neighbor.rightOffset);
-    if (delta > 0.5) seamIssues.push(`接缝 ${neighbor.code}/${segment.code} 偏移不一致 ${delta.toFixed(1)} mm`);
-  });
-  const closureIssues: string[] = [];
-  if (!isClosed) closureIssues.push(`角度偏差 ${closureDelta.toFixed(2)}°`);
-  if (!isArcClosed) closureIssues.push(`前后弧长不闭合 ${arcClosure.error.toFixed(1)} mm`);
-  closureIssues.push(...seamIssues);
-  if (ring.wedgeAmount < 0 || ring.wedgeAmount >= ring.ringWidth) {
-    closureIssues.push(`楔形量需在 0 ~ ${ring.ringWidth} mm 之间`);
-  }
-  const ringIsValid = ring.outerDiameter > ring.innerDiameter && ring.innerDiameter > 0 && ring.ringWidth > 0;
-  const stretchFactor = 1 + Math.max(0, ring.stretchRate) / 100;
+  const validation = useMemo(() => validateUsage(calculated, segments, ring), [calculated, segments, ring]);
+  const angleSum = validation.angleSum;
+  const closureIssues = validation.issues;
+  const ringIsValid = validation.isRingValid;
+  const stretchFactor = stretchFactorOf(ring.stretchRate);
   const totals = useMemo(() => ({
     epdm: calculated.reduce((sum, segment) => sum + segment.epdmTotal, 0),
     swell: calculated.reduce((sum, segment) => sum + segment.swellTotal, 0),
@@ -416,6 +167,13 @@ export function UniversalShieldConfigurator() {
     setExplodeProgress(0);
   };
 
+  /** 导出算量契约 JSON（橡胶 ERP「管片算量」模块按此契约导入） */
+  const exportUsageJson = () => {
+    const payload = buildUsagePayload(ring, products, segments);
+    const safeName = safeFileName(ring.projectName);
+    downloadJson(`${safeName}-算量契约-${payload.schemaVersion.split("/").join("_")}.json`, payload);
+  };
+
   const exportDetails = () => {
     const rows: CsvValue[][] = [
       ["盾构管片通用建模器 V2 · 参数与产品用量明细"],
@@ -446,7 +204,7 @@ export function UniversalShieldConfigurator() {
       ["整环汇总", "EPDM 弹性密封垫", (totals.epdm / 1000).toFixed(3), (totals.epdm / stretchFactor / 1000).toFixed(3)],
       ["整环汇总", "遇水膨胀橡胶片", (totals.swell / 1000).toFixed(3), (totals.swell / stretchFactor / 1000).toFixed(3)],
     );
-    const safeName = ring.projectName.trim().replace(/[\\/:*?"<>|]+/g, "-") || "盾构管片";
+    const safeName = safeFileName(ring.projectName);
     downloadCsv(`${safeName}-参数与产品用量明细-V2.csv`, rows);
   };
 
@@ -760,7 +518,7 @@ export function UniversalShieldConfigurator() {
         <section className="v2-table-card v2-card">
           <div className="v2-section-heading v2-table-heading">
             <div><small>SEGMENT INPUT TABLE</small><h2>管片数据输入表</h2><p>弧长单位为 mm；留空或填 0 时按中心角与对应中心线半径计算。左/右缝偏移单位为 mm，留空按封顶块中心对称自动计算（F 两侧 = ±(F 后弧 − F 前弧) ÷ 2），填值则覆盖。</p></div>
-            <div className="v2-table-actions"><button type="button" onClick={addSegment}>＋ 新增一块</button><button className="v2-primary-action" type="button" onClick={exportDetails}>↓ 导出参数与用量明细</button></div>
+            <div className="v2-table-actions"><button type="button" onClick={addSegment}>＋ 新增一块</button><button type="button" onClick={exportUsageJson}>⇪ 导出算量 JSON</button><button className="v2-primary-action" type="button" onClick={exportDetails}>↓ 导出参数与用量明细</button></div>
           </div>
           <div className="v2-table-scroll">
             <table className="v2-input-table">

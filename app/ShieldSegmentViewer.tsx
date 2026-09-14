@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { downloadCsv, type CsvValue } from "./lib/csv";
+import { downloadCsv, type CsvValue } from "./lib/download";
 import { buildProductFrame, buildSegmentGeometry } from "./lib/segmentGeometry";
 
 type SegmentDefinition = {
